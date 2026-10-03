@@ -1,0 +1,2 @@
+# Optional but recommended — richer traffic & connection data
+psutil>=5.9
