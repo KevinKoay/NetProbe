@@ -1,4 +1,4 @@
-# NetProbe v1.3 — Portable Network Testing & Traffic Analysis Suite
+# NetProbe — Portable Network Testing & Traffic Analysis Suite
 
 One folder. Copy it to a USB stick or your laptop, double-click, and you have a
 **GUI with one-click shortcut buttons** + **multiple parallel terminal panes** +
