@@ -35,6 +35,12 @@ import threading
 from collections import deque
 from urllib.parse import urlparse
 
+import struct
+import random
+import uuid
+import base64
+import hashlib
+
 try:
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox
@@ -1762,6 +1768,1201 @@ def generate_report(emit, host: str, path: str = "") -> str:
 # ----------------------------------------------------------------------------
 # Cross-platform command builders
 # ----------------------------------------------------------------------------
+
+# ----------------------------------------------------------------------------
+# Protocol tests: HTTP / HTTPS / FTP / SFTP / WebSocket / DNS / mDNS / LLMNR /
+# DHCP / NTP / ARP / NDP / SMB / NFS / SSDP / SMTP / IMAP / POP3 / SSH /
+# Telnet / RDP / SNMP / Syslog / ICMP / BGP / OSPF / EIGRP
+# ----------------------------------------------------------------------------
+
+def _sp_kwargs():
+    """Safe subprocess kwargs for Windows no-window execution."""
+    return {k: v for k, v in popen_kwargs().items() if k == "creationflags"}
+
+
+def _short_text(value, limit=180):
+    s = str(value).replace("\r", " ").replace("\n", " | ")
+    return s if len(s) <= limit else s[:limit] + "…"
+
+
+def _tcp_connect(host, port, timeout=5.0):
+    """Resolve + TCP connect, returning (socket, ip, dns_ms, tcp_ms)."""
+    addrs, dns_ms = dns_resolve(host)
+    ip = addrs[0]
+    t0 = time.perf_counter()
+    s = socket.create_connection((ip, port), timeout)
+    ms = (time.perf_counter() - t0) * 1000.0
+    return s, ip, dns_ms, ms
+
+
+def _read_smtp_reply(f, timeout=5.0):
+    """Read SMTP/FTP style reply, including multiline replies."""
+    line = f.readline().decode("utf-8", "replace").strip()
+    if not line:
+        return ""
+    lines = [line]
+    if len(line) >= 4 and line[3] == "-":
+        code = line[:3]
+        while True:
+            nxt = f.readline().decode("utf-8", "replace").strip()
+            if not nxt:
+                break
+            lines.append(nxt)
+            if nxt.startswith(code + " "):
+                break
+    return "\n".join(lines)
+
+
+def _read_until_prefix(f, prefix, timeout=5.0, max_lines=25):
+    lines = []
+    for _ in range(max_lines):
+        line = f.readline().decode("utf-8", "replace").strip()
+        if not line:
+            break
+        lines.append(line)
+        if line.startswith(prefix):
+            break
+    return "\n".join(lines)
+
+
+def _wrap_ssl(sock, host, timeout=5.0):
+    """Wrap socket in TLS. Falls back to unverified context for diagnostics."""
+    ctx = ssl.create_default_context()
+    try:
+        return ctx.wrap_socket(sock, server_hostname=host), True, ""
+    except ssl.SSLCertVerificationError as e:
+        try:
+            return ssl._create_unverified_context().wrap_socket(sock, server_hostname=host), False, str(e)
+        except Exception as e2:
+            raise e2
+
+
+def test_http_protocol(host, port=None, timeout=8.0, tls=False, stop=None):
+    proto = "HTTPS" if tls else "HTTP"
+    out = {"protocol": proto, "host": host, "port": port}
+    try:
+        if re.match(r"^https?://", host or "", re.I):
+            url = host
+        else:
+            h = host or "example.com"
+            if tls:
+                port = int(port or 443)
+                url = f"https://{h}/" if port == 443 else f"https://{h}:{port}/"
+            else:
+                port = int(port or 80)
+                url = f"http://{h}/" if port == 80 else f"http://{h}:{port}/"
+
+        r = http_probe(url, timeout=timeout)
+        out.update(r)
+        out["ok"] = bool(r.get("status")) and not r.get("error")
+        out["summary"] = f"status={r.get('status','-')} total={r.get('total_ms', 0) or 0:.1f} ms"
+    except Exception as e:
+        out["ok"] = False
+        out["error"] = str(e)
+    return out
+
+
+def test_websocket(host, port=None, timeout=6.0, stop=None):
+    out = {"protocol": "WebSocket", "target": host}
+    try:
+        if re.match(r"^wss?://", host or "", re.I):
+            u = urlparse(host)
+            tls = (u.scheme == "wss")
+            h = u.hostname or ""
+            port = u.port or (443 if tls else 80)
+            path = u.path or "/"
+            if u.query:
+                path += "?" + u.query
+        else:
+            h = host or "example.com"
+            tls = (port == 443)
+            port = int(port or (443 if tls else 80))
+            path = "/"
+
+        key = base64.b64encode(os.urandom(16)).decode()
+        host_hdr = h if port in (80, 443) else f"{h}:{port}"
+        req = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host_hdr}\r\n"
+            f"Upgrade: websocket\r\n"
+            f"Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n"
+            f"\r\n"
+        )
+
+        addrs, dns_ms = dns_resolve(h)
+        ip = addrs[0]
+        out.update({"host": h, "port": port, "ip": ip, "dns_ms": dns_ms})
+
+        t0 = time.perf_counter()
+        sock = socket.create_connection((ip, port), timeout)
+        out["tcp_ms"] = (time.perf_counter() - t0) * 1000.0
+
+        verified = True
+        if tls:
+            sock, verified, verr = _wrap_ssl(sock, h, timeout)
+            out["tls_verified"] = verified
+            if verr:
+                out["tls_verify_error"] = verr
+
+        sock.settimeout(timeout)
+        sock.sendall(req.encode("latin-1"))
+
+        buf = b""
+        while b"\r\n\r\n" not in buf and len(buf) < 16384:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+
+        head = buf.split(b"\r\n\r\n", 1)[0].decode("latin-1", "replace")
+        status = None
+        m = re.match(r"HTTP/\S+\s+(\d+)", head)
+        if m:
+            status = int(m.group(1))
+
+        expected = base64.b64encode(
+            hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()
+        ).decode()
+        accept_ok = expected.lower() in head.lower()
+
+        out.update({
+            "status": status,
+            "sec_websocket_accept_ok": accept_ok,
+            "response_headers": head[:500],
+        })
+        out["ok"] = (status == 101 and accept_ok)
+        out["summary"] = f"HTTP status {status}" + ("" if out["ok"] else " (expected 101)")
+        sock.close()
+    except Exception as e:
+        out["ok"] = False
+        out["error"] = str(e)
+    return out
+
+
+def test_ftp(host, port=21, timeout=6.0, stop=None):
+    out = {"protocol": "FTP", "host": host, "port": port}
+    try:
+        s, ip, dns_ms, tcp_ms = _tcp_connect(host, port, timeout)
+        out.update({"ip": ip, "dns_ms": dns_ms, "tcp_ms": tcp_ms})
+        s.settimeout(timeout)
+        f = s.makefile("rb")
+
+        banner = _read_smtp_reply(f, timeout)
+        out["banner"] = banner
+        ok = banner.startswith("220")
+
+        if ok:
+            s.sendall(b"USER anonymous\r\n")
+            user = _read_smtp_reply(f, timeout)
+            out["user"] = user
+
+            if user.startswith("331"):
+                s.sendall(b"PASS netprobe@example.com\r\n")
+                pw = _read_smtp_reply(f, timeout)
+                out["pass"] = pw
+                ok = bool(pw) and pw[0].isdigit()
+
+            s.sendall(b"QUIT\r\n")
+            try:
+                _read_smtp_reply(f, timeout)
+            except Exception:
+                pass
+
+        out["ok"] = ok
+        out["summary"] = banner.splitlines()[0] if banner else "no banner"
+        s.close()
+    except Exception as e:
+        out["ok"] = False
+        out["error"] = str(e)
+    return out
+
+
+def test_sftp(host, port=22, timeout=6.0, stop=None):
+    out = {"protocol": "SFTP", "host": host, "port": port}
+    try:
+        s, ip, dns_ms, tcp_ms = _tcp_connect(host, port, timeout)
+        out.update({"ip": ip, "dns_ms": dns_ms, "tcp_ms": tcp_ms})
+        s.settimeout(timeout)
+        f = s.makefile("rb")
+
+        banner = f.readline().decode("utf-8", "replace").strip()
+        out["ssh_banner"] = banner
+        ok = banner.startswith("SSH-")
+
+        if ok:
+            s.sendall(b"SSH-2.0-NetProbe\r\n")
+
+        out["ok"] = ok
+        out["summary"] = (
+            "SSH banner detected; full SFTP subsystem test requires credentials/paramiko"
+            if ok else "No SSH banner"
+        )
+        s.close()
+    except Exception as e:
+        out["ok"] = False
+        out["error"] = str(e)
+    return out
+
+
+def test_dns_protocol(host, port=53, timeout=4.0, stop=None):
+    out = {"protocol": "DNS", "target": host, "server_port": port}
+    try:
+        name = host or "example.com"
+        server = "1.1.1.1"
+
+        # Allow target format: example.com@8.8.8.8
+        if "@" in name:
+            name, server = name.rsplit("@", 1)
+
+        ms, pkt = dns_query(server, name, qtype=1, timeout=timeout)
+        rc = pkt.get("rcode")
+        answers = [a[3] for a in pkt.get("answers", []) if a[1] in (1, 28)]
+
+        out.update({
+            "server": server,
+            "name": name,
+            "ms": ms,
+            "rcode": rc,
+            "answers": answers[:6],
+        })
+        out["ok"] = (rc == 0)
+        out["summary"] = f"{len(answers)} answer(s) in {ms:.1f} ms"
+    except Exception as e:
+        out["ok"] = False
+        out["error"] = str(e)
+    return out
+
+
+def test_mdns_protocol(host=None, port=None, timeout=5.0, stop=None):
+    out = {"protocol": "mDNS"}
+    sock = None
+    seen = {}
+    try:
+        sock = _mdns_socket()
+        sock.settimeout(0.5)
+        end = time.time() + timeout
+        sent = False
+
+        while time.time() < end:
+            if stop is not None and stop.is_set():
+                break
+
+            if not sent:
+                sock.sendto(
+                    build_dns_query([(s, 12) for s in MDNS_SERVICES]),
+                    (MDNS_ADDR, MDNS_PORT)
+                )
+                sent = True
+
+            try:
+                data, addr = sock.recvfrom(9000)
+            except socket.timeout:
+                continue
+            except Exception:
+                break
+
+            pkt = parse_dns_message(data)
+            for name, rtype, ttl, val in pkt.get("answers", []):
+                key = (name, rtype, val)
+                seen[key] = addr[0]
+
+        out["ok"] = bool(seen)
+        out["answers"] = len(seen)
+        out["sample"] = [
+            f"{ip} {name} -> {val}"
+            for (name, rtype, val), ip in list(seen.items())[:8]
+        ]
+        out["summary"] = f"{len(seen)} mDNS answer(s)"
+    except Exception as e:
+        out["ok"] = False
+        out["error"] = str(e)
+    finally:
+        if sock:
+            sock.close()
+    return out
+
+
+def test_llmnr_protocol(host="wpad", port=5355, timeout=5.0, stop=None):
+    out = {"protocol": "LLMNR", "query": host or "wpad"}
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if hasattr(socket, "SO_REUSEPORT"):
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            except Exception:
+                pass
+
+        try:
+            sock.bind(("", 5355))
+        except Exception:
+            sock.bind(("", 0))
+
+        try:
+            mreq = socket.inet_aton("224.0.0.252") + socket.inet_aton("0.0.0.0")
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        except Exception:
+            pass
+
+        sock.settimeout(0.5)
+        msg = build_dns_query([(host or "wpad", 1)], tid=random.randint(0, 65535))
+        sock.sendto(msg, ("224.0.0.252", 5355))
+
+        end = time.time() + timeout
+        answers = []
+
+        while time.time() < end:
+            if stop is not None and stop.is_set():
+                break
+            try:
+                data, addr = sock.recvfrom(9000)
+            except socket.timeout:
+                continue
+            except Exception:
+                break
+
+            pkt = parse_dns_message(data)
+            for name, rtype, ttl, val in pkt.get("answers", []):
+                if rtype in (1, 28):
+                    answers.append((addr[0], name, val))
+
+        out["ok"] = bool(answers)
+        out["answers"] = answers[:8]
+        out["summary"] = f"{len(answers)} LLMNR answer(s)"
+    except Exception as e:
+        out["ok"] = False
+        out["error"] = str(e)
+    finally:
+        if sock:
+            sock.close()
+    return out
+
+
+def test_dhcp_protocol(host=None, port=None, timeout=7.0, stop=None):
+    out = {"protocol": "DHCP"}
+    sock = None
+    try:
+        xid = random.randint(0, 0xFFFFFFFF)
+        mac = uuid.getnode().to_bytes(6, "big")
+
+        bootp = struct.pack(
+            "!BBBBIHH4s4s4s4s16s64s128s",
+            1, 1, 6, 0, xid, 0, 0x8000,
+            b"\0" * 4, b"\0" * 4, b"\0" * 4, b"\0" * 4,
+            mac.ljust(16, b"\0"), b"\0" * 64, b"\0" * 128
+        )
+
+        opts = b"\x63\x82\x53\x63"
+        opts += bytes([53, 1, 1])          # DHCPDISCOVER
+        opts += bytes([61, 7, 1]) + mac    # Client identifier
+        opts += bytes([12, 8]) + b"netprobe"
+        opts += bytes([55, 4, 1, 3, 6, 15])  # subnet, router, dns, domain
+        opts += bytes([255])
+
+        pkt = bootp + opts
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+
+        try:
+            sock.bind(("", 68))
+            out["bind"] = "0.0.0.0:68"
+        except Exception as e:
+            out["bind_error"] = str(e)
+            sock.bind(("", 0))
+            out["note"] = "Could not bind UDP/68; DHCP replies usually require root/admin."
+
+        sock.settimeout(timeout)
+        sock.sendto(pkt, ("255.255.255.255", 67))
+
+        end = time.time() + timeout
+        offers = []
+
+        while time.time() < end:
+            if stop is not None and stop.is_set():
+                break
+            try:
+                data, addr = sock.recvfrom(4096)
+            except socket.timeout:
+                break
+
+            if len(data) >= 240:
+                yiaddr = socket.inet_ntoa(data[16:20])
+                offers.append({
+                    "server": addr[0],
+                    "offered_ip": yiaddr if yiaddr != "0.0.0.0" else "-",
+                })
+
+        out["ok"] = bool(offers)
+        out["offers"] = offers
+        out["summary"] = f"{len(offers)} DHCP offer(s)" if offers else "No DHCP offer received"
+    except Exception as e:
+        out["ok"] = False
+        out["error"] = str(e)
+    finally:
+        if sock:
+            sock.close()
+    return out
+
+
+def test_ntp_protocol(host, port=123, timeout=4.0, stop=None):
+    out = {"protocol": "NTP", "host": host, "port": port}
+    s = None
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(timeout)
+
+        req = b"\x1b" + b"\0" * 47
+        t0 = time.perf_counter()
+        s.sendto(req, (host, port))
+        data, _ = s.recvfrom(1024)
+        rtt = (time.perf_counter() - t0) * 1000.0
+        out["rtt_ms"] = rtt
+
+        if len(data) >= 48:
+            stratum = data[1]
+            tx = struct.unpack("!I", data[40:44])[0]
+            if tx:
+                unix = tx - 2208988800
+                out["time"] = datetime.datetime.fromtimestamp(unix).isoformat()
+            out["stratum"] = stratum
+            out["ok"] = True
+            out["summary"] = f"NTP response received, stratum {stratum}"
+        else:
+            out["ok"] = False
+            out["error"] = "short response"
+    except Exception as e:
+        out["ok"] = False
+        out["error"] = str(e)
+    finally:
+        if s:
+            s.close()
+    return out
+
+
+def test_arp_protocol(host=None, port=None, timeout=5.0, stop=None):
+    out = {"protocol": "ARP"}
+    target = host if host and re.match(r"^\d+\.\d+\.\d+\.\d+$", host) else None
+
+    if target:
+        arping = shutil_which("arping")
+        if arping:
+            cmd = [arping, "-c", "1", "-w", str(max(1, int(timeout))), target]
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True,
+                                   timeout=timeout + 5, **_sp_kwargs())
+                out["arping"] = _short_text(r.stdout or r.stderr, 220)
+            except Exception as e:
+                out["arping_error"] = str(e)
+        else:
+            try:
+                icmp_ping_once(target, timeout=2.0)
+            except Exception:
+                pass
+
+    entries = arp_entries()
+    out["entries"] = len(entries)
+    out["sample"] = [f"{ip} {mac} {ifc}" for ip, (mac, ifc) in list(entries.items())[:10]]
+
+    if target:
+        out["ok"] = target in entries
+        out["summary"] = f"target {target} " + ("found in ARP cache" if out["ok"] else "not in ARP cache")
+    else:
+        out["ok"] = len(entries) > 0
+        out["summary"] = f"{len(entries)} ARP cache entries"
+
+    return out
+
+
+def test_ndp_protocol(host=None, port=None, timeout=8.0, stop=None):
+    out = {"protocol": "NDP"}
+    try:
+        if IS_WIN:
+            cmd = ["netsh", "interface", "ipv6", "show", "neighbors"]
+        elif IS_MAC:
+            cmd = ["ndp", "-an"]
+        else:
+            cmd = ["ip", "-6", "neigh", "show"]
+
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=timeout + 8, **_sp_kwargs())
+        txt = r.stdout or ""
+
+        ipv6s = re.findall(r"(?i)[0-9a-f]{1,4}(?::[0-9a-f]{1,4}){2,7}", txt)
+        entries = sorted(set(ipv6s))
+
+        out["entries"] = len(entries)
+        out["sample"] = entries[:12]
+        out["ok"] = len(entries) > 0
+        out["summary"] = f"{len(entries)} IPv6 neighbour entry(ies)"
+    except Exception as e:
+        out["ok"] = False
+        out["error"] = str(e)
+    return out
+
+
+def test_smb_protocol(host, port=445, timeout=5.0, stop=None):
+    out = {"protocol": "SMB", "host": host, "port": port}
+    try:
+        s, ip, dns_ms, tcp_ms = _tcp_connect(host, port, timeout)
+        out.update({"ip": ip, "dns_ms": dns_ms, "tcp_ms": tcp_ms})
+        s.settimeout(timeout)
+
+        guid = os.urandom(16)
+
+        # Minimal SMB2 negotiate request.
+        header = b"\xfeSMB" + struct.pack(
+            "<HHIHHIIQIIQ16s",
+            64, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, b"\0" * 16
+        )
+        negotiate = struct.pack(
+            "<HHHHI16sQ",
+            36, 2, 1, 0, 0, guid, 0
+        ) + struct.pack("<HH", 0x0202, 0x0210)
+
+        payload = header + negotiate
+        pkt = b"\x00" + len(payload).to_bytes(3, "big") + payload
+        s.sendall(pkt)
+
+        try:
+            resp = s.recv(4096)
+            out["response_bytes"] = len(resp)
+            if len(resp) > 4 and resp[4:8] == b"\xfeSMB":
+                out["smb_response"] = "SMB2 response seen"
+                out["ok"] = True
+                out["summary"] = "SMB port open and SMB2 response seen"
+            else:
+                out["ok"] = True
+                out["note"] = "TCP open, but no SMB2 response parsed"
+                out["summary"] = "SMB port open"
+        except socket.timeout:
+            out["ok"] = True
+            out["note"] = "TCP open, no SMB2 response within timeout"
+            out["summary"] = "SMB port open"
+
+        s.close()
+    except Exception as e:
+        out["ok"] = False
+        out["error"] = str(e)
+    return out
+
+
+def test_nfs_protocol(host, port=2049, timeout=5.0, stop=None):
+    out = {"protocol": "NFS", "host": host}
+    ports = {int(port or 2049), 2049, 111}
+    open_ports = []
+
+    for p in sorted(ports):
+        try:
+            s, ip, dns_ms, ms = _tcp_connect(host, p, timeout=3.0)
+            s.close()
+            open_ports.append(p)
+        except Exception:
+            pass
+
+    out["open_ports"] = open_ports
+    out["ok"] = bool(open_ports)
+
+    showmount = shutil_which("showmount")
+    if showmount:
+        try:
+            r = subprocess.run([showmount, "-e", host], capture_output=True, text=True,
+                               timeout=timeout + 8, **_sp_kwargs())
+            out["showmount"] = _short_text(r.stdout or r.stderr, 300)
+            if "Export list" in (r.stdout or ""):
+                out["ok"] = True
+        except Exception as e:
+            out["showmount_error"] = str(e)
+
+    out["summary"] = f"open NFS-related ports: {open_ports or 'none'}"
+    return out
+
+
+def test_ssdp_protocol(host=None, port=None, timeout=5.0, stop=None):
+    out = {"protocol": "SSDP"}
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+        except Exception:
+            pass
+        sock.settimeout(0.5)
+
+        msg = (
+            "M-SEARCH * HTTP/1.1\r\n"
+            "HOST: 239.255.255.250:1900\r\n"
+            "MAN: \"ssdp:discover\"\r\n"
+            "MX: 2\r\n"
+            "ST: ssdp:all\r\n"
+            "\r\n"
+        ).encode()
+
+        sock.sendto(msg, ("239.255.255.250", 1900))
+        end = time.time() + timeout
+        devices = {}
+
+        while time.time() < end:
+            if stop is not None and stop.is_set():
+                break
+            try:
+                data, addr = sock.recvfrom(4096)
+            except socket.timeout:
+                continue
+            except Exception:
+                break
+
+            txt = data.decode("utf-8", "replace")
+            first = txt.splitlines()[0] if txt else ""
+            loc = re.search(r"LOCATION:\s*(\S+)", txt, re.I)
+            srv = re.search(r"SERVER:\s*(.+)", txt, re.I)
+
+            devices[addr[0]] = {
+                "first": first,
+                "location": loc.group(1) if loc else "",
+                "server": srv.group(1).strip() if srv else "",
+            }
+
+        out["ok"] = bool(devices)
+        out["devices"] = len(devices)
+        out["sample"] = [
+            f"{ip}: {d.get('server','')} {d.get('location','')}"
+            for ip, d in list(devices.items())[:8]
+        ]
+        out["summary"] = f"{len(devices)} SSDP device(s)"
+    except Exception as e:
+        out["ok"] = False
+        out["error"] = str(e)
+    finally:
+        if sock:
+            sock.close()
+    return out
+
+
+def test_smtp_protocol(host, port=25, timeout=6.0, stop=None):
+    out = {"protocol": "SMTP", "host": host, "port": port}
+    try:
+        s, ip, dns_ms, tcp_ms = _tcp_connect(host, port, timeout)
+        out.update({"ip": ip, "dns_ms": dns_ms, "tcp_ms": tcp_ms})
+        s.settimeout(timeout)
+        f = s.makefile("rb")
+
+        banner = _read_smtp_reply(f, timeout)
+        out["banner"] = banner
+        ok = banner.startswith("220")
+
+        if ok:
+            s.sendall(b"EHLO netprobe.local\r\n")
+            ehlo = _read_smtp_reply(f, timeout)
+            out["ehlo"] = ehlo
+            ok = ehlo.startswith("250")
+
+            s.sendall(b"QUIT\r\n")
+            try:
+                out["quit"] = _read_smtp_reply(f, timeout)
+            except Exception:
+                pass
+
+        out["ok"] = ok
+        out["summary"] = banner.splitlines()[0] if banner else "no banner"
+        s.close()
+    except Exception as e:
+        out["ok"] = False
+        out["error"] = str(e)
+    return out
+
+
+def test_imap_protocol(host, port=143, timeout=6.0, stop=None):
+    out = {"protocol": "IMAP", "host": host, "port": port}
+    try:
+        s, ip, dns_ms, tcp_ms = _tcp_connect(host, port, timeout)
+        out.update({"ip": ip, "dns_ms": dns_ms, "tcp_ms": tcp_ms})
+
+        if port == 993:
+            s, verified, verr = _wrap_ssl(s, host, timeout)
+            out["tls_verified"] = verified
+            if verr:
+                out["tls_verify_error"] = verr
+
+        s.settimeout(timeout)
+        f = s.makefile("rb")
+
+        banner = f.readline().decode("utf-8", "replace").strip()
+        out["banner"] = banner
+        ok = banner.startswith("* OK")
+
+        if ok:
+            s.sendall(b"a1 CAPABILITY\r\n")
+            cap = _read_until_prefix(f, "a1 ", timeout)
+            out["capability"] = cap
+            ok = "a1 OK" in cap
+
+            s.sendall(b"a2 LOGOUT\r\n")
+            try:
+                _read_until_prefix(f, "a2 ", timeout)
+            except Exception:
+                pass
+
+        out["ok"] = ok
+        out["summary"] = "IMAP banner OK" if ok else "IMAP unexpected banner"
+        s.close()
+    except Exception as e:
+        out["ok"] = False
+        out["error"] = str(e)
+    return out
+
+
+def test_pop3_protocol(host, port=110, timeout=6.0, stop=None):
+    out = {"protocol": "POP3", "host": host, "port": port}
+    try:
+        s, ip, dns_ms, tcp_ms = _tcp_connect(host, port, timeout)
+        out.update({"ip": ip, "dns_ms": dns_ms, "tcp_ms": tcp_ms})
+
+        if port == 995:
+            s, verified, verr = _wrap_ssl(s, host, timeout)
+            out["tls_verified"] = verified
+            if verr:
+                out["tls_verify_error"] = verr
+
+        s.settimeout(timeout)
+        f = s.makefile("rb")
+
+        banner = f.readline().decode("utf-8", "replace").strip()
+        out["banner"] = banner
+        ok = banner.startswith("+OK")
+
+        if ok:
+            s.sendall(b"CAPA\r\n")
+            capa = []
+            for _ in range(25):
+                line = f.readline().decode("utf-8", "replace").strip()
+                if not line or line == ".":
+                    break
+                capa.append(line)
+            out["capa"] = " | ".join(capa[:10])
+
+            s.sendall(b"QUIT\r\n")
+            try:
+                out["quit"] = f.readline().decode("utf-8", "replace").strip()
+            except Exception:
+                pass
+
+        out["ok"] = ok
+        out["summary"] = banner or "no banner"
+        s.close()
+    except Exception as e:
+        out["ok"] = False
+        out["error"] = str(e)
+    return out
+
+
+def test_ssh_protocol(host, port=22, timeout=6.0, stop=None):
+    out = {"protocol": "SSH", "host": host, "port": port}
+    try:
+        s, ip, dns_ms, tcp_ms = _tcp_connect(host, port, timeout)
+        out.update({"ip": ip, "dns_ms": dns_ms, "tcp_ms": tcp_ms})
+        s.settimeout(timeout)
+        f = s.makefile("rb")
+
+        banner = f.readline().decode("utf-8", "replace").strip()
+        out["banner"] = banner
+        ok = banner.startswith("SSH-")
+
+        if ok:
+            s.sendall(b"SSH-2.0-NetProbe\r\n")
+
+        out["ok"] = ok
+        out["summary"] = "SSH banner detected" if ok else "No SSH banner"
+        s.close()
+    except Exception as e:
+        out["ok"] = False
+        out["error"] = str(e)
+    return out
+
+
+def test_telnet_protocol(host, port=23, timeout=5.0, stop=None):
+    out = {"protocol": "Telnet", "host": host, "port": port}
+    try:
+        s, ip, dns_ms, tcp_ms = _tcp_connect(host, port, timeout)
+        out.update({"ip": ip, "dns_ms": dns_ms, "tcp_ms": tcp_ms})
+        s.settimeout(timeout)
+
+        data = b""
+        try:
+            data = s.recv(1024)
+        except socket.timeout:
+            pass
+
+        out["banner_hex"] = data[:80].hex()
+
+        try:
+            s.sendall(b"\r\n")
+            data2 = s.recv(1024)
+            out["post_crlf_hex"] = data2[:80].hex()
+        except Exception:
+            pass
+
+        out["ok"] = True
+        out["summary"] = "TCP open; Telnet may require interactive negotiation"
+        s.close()
+    except Exception as e:
+        out["ok"] = False
+        out["error"] = str(e)
+    return out
+
+
+def test_rdp_protocol(host, port=3389, timeout=5.0, stop=None):
+    out = {"protocol": "RDP", "host": host, "port": port}
+    try:
+        s, ip, dns_ms, tcp_ms = _tcp_connect(host, port, timeout)
+        out.update({"ip": ip, "dns_ms": dns_ms, "tcp_ms": tcp_ms, "tcp_open": True})
+        s.settimeout(timeout)
+
+        # Minimal X.224/RDP negotiation request.
+        req = bytes.fromhex("030000130ee000000000000100080003000000")
+        s.sendall(req)
+
+        try:
+            resp = s.recv(1024)
+        except socket.timeout:
+            resp = b""
+
+        out["response_bytes"] = len(resp)
+
+        if resp.startswith(b"\x03\x00"):
+            out["ok"] = True
+            out["summary"] = "RDP TPKT response seen"
+        else:
+            out["ok"] = False
+            out["summary"] = "TCP open, but no RDP TPKT response"
+
+        s.close()
+    except Exception as e:
+        out["ok"] = False
+        out["error"] = str(e)
+    return out
+
+
+def test_snmp_protocol(host, port=161, timeout=4.0, stop=None):
+    out = {"protocol": "SNMP", "host": host, "port": port, "community": "public"}
+    s = None
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(timeout)
+
+        # SNMPv2c GET sysDescr.0 with community public.
+        pkt = bytes.fromhex(
+            "302902010104067075626c6963a01c020401020304020100020100300e300c"
+            "06082b060102010101000500"
+        )
+
+        s.sendto(pkt, (host, port))
+        data, _ = s.recvfrom(4096)
+
+        out["response_bytes"] = len(data)
+        out["ok"] = len(data) > 0 and data[0] == 0x30
+        out["summary"] = "SNMP response received" if out["ok"] else "response not parseable"
+    except Exception as e:
+        out["ok"] = False
+        out["error"] = str(e)
+    finally:
+        if s:
+            s.close()
+    return out
+
+
+def test_syslog_protocol(host, port=514, timeout=4.0, stop=None):
+    out = {"protocol": "Syslog", "host": host, "port": port}
+    try:
+        msg = (
+            f"<{19 * 8 + 6}>"
+            f"{datetime.datetime.now().strftime('%b %d %H:%M:%S')} "
+            f"netprobe: protocol test"
+        ).encode()
+
+        if port == 6514:
+            s, ip, dns_ms, tcp_ms = _tcp_connect(host, port, timeout)
+            out.update({"ip": ip, "dns_ms": dns_ms, "tcp_ms": tcp_ms, "transport": "TCP"})
+            s.sendall(msg + b"\n")
+            s.close()
+        else:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(timeout)
+            s.sendto(msg, (host, port))
+            s.close()
+            out["transport"] = "UDP"
+
+        out["ok"] = True
+        out["summary"] = "message sent; UDP syslog has no delivery acknowledgement"
+    except Exception as e:
+        out["ok"] = False
+        out["error"] = str(e)
+    return out
+
+
+def test_icmp_protocol(host, port=None, timeout=12.0, stop=None):
+    out = {"protocol": "ICMP", "host": host}
+    vals = []
+
+    for _ in range(3):
+        if stop is not None and stop.is_set():
+            break
+        ms = icmp_ping_once(host, timeout=3.0)
+        vals.append(ms)
+        time.sleep(0.2)
+
+    ok = [v for v in vals if v is not None]
+    out["samples"] = vals
+    out["ok"] = bool(ok)
+    out["summary"] = f"{len(ok)}/{len(vals)} replies"
+    if ok:
+        out["summary"] += f", avg {sum(ok) / len(ok):.1f} ms"
+
+    return out
+
+
+def test_bgp_protocol(host, port=179, timeout=6.0, stop=None):
+    out = {"protocol": "BGP", "host": host, "port": port}
+    try:
+        s, ip, dns_ms, tcp_ms = _tcp_connect(host, port, timeout)
+        out.update({"ip": ip, "dns_ms": dns_ms, "tcp_ms": tcp_ms})
+        s.settimeout(timeout)
+
+        asn = 65001
+        open_body = struct.pack(
+            "!BHH4sB",
+            4, asn, 90, socket.inet_aton("192.0.2.1"), 0
+        )
+        msg = b"\xff" * 16 + struct.pack("!HB", 29, 1) + open_body
+        s.sendall(msg)
+
+        try:
+            resp = s.recv(4096)
+        except socket.timeout:
+            resp = b""
+
+        out["response_bytes"] = len(resp)
+
+        if len(resp) >= 19 and resp[:16] == b"\xff" * 16:
+            mtype = resp[18]
+            out["bgp_message_type"] = {
+                1: "OPEN",
+                2: "UPDATE",
+                3: "NOTIFICATION",
+                4: "KEEPALIVE",
+            }.get(mtype, mtype)
+
+            if mtype == 3 and len(resp) >= 21:
+                out["notification_code"] = resp[19]
+                out["notification_subcode"] = resp[20]
+
+            out["ok"] = True
+            out["summary"] = f"BGP reachable, received {out['bgp_message_type']}"
+        else:
+            out["ok"] = False
+            out["summary"] = "TCP open, but no BGP message received"
+
+        s.close()
+    except Exception as e:
+        out["ok"] = False
+        out["error"] = str(e)
+    return out
+
+
+def _raw_protocol_listen(proto, multicast, timeout, out):
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, proto)
+        sock.settimeout(timeout)
+
+        try:
+            if multicast:
+                mreq = socket.inet_aton(multicast) + socket.inet_aton("0.0.0.0")
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        except Exception:
+            pass
+
+        try:
+            sock.bind(("", 0))
+        except Exception:
+            pass
+
+        data = sock.recv(65535)
+        out["ok"] = len(data) > 0
+        out["bytes"] = len(data)
+        out["summary"] = (
+            f"raw packet received ({len(data)} bytes); root/CAP_NET_RAW and local traffic required"
+        )
+    except PermissionError as e:
+        out["ok"] = False
+        out["error"] = f"raw socket permission denied: {e}"
+        out["summary"] = "Run as root/administrator to test raw routing protocols."
+    except socket.timeout:
+        out["ok"] = False
+        out["error"] = "timeout waiting for raw packet"
+        out["summary"] = "No local packets observed. Routing protocol must be present on this segment."
+    except Exception as e:
+        out["ok"] = False
+        out["error"] = str(e)
+    finally:
+        if sock:
+            sock.close()
+
+    return out
+
+
+def test_ospf_protocol(host=None, port=None, timeout=5.0, stop=None):
+    out = {"protocol": "OSPF"}
+    return _raw_protocol_listen(89, "224.0.0.5", timeout, out)
+
+
+def test_eigrp_protocol(host=None, port=None, timeout=5.0, stop=None):
+    out = {"protocol": "EIGRP"}
+    return _raw_protocol_listen(88, "224.0.0.10", timeout, out)
+
+
+PROTOCOL_TESTS = {
+    "HTTP": {
+        "fn": lambda h, p, stop: test_http_protocol(h, p or 80, tls=False, stop=stop),
+        "port": 80,
+        "note": "HTTP GET timing/status.",
+    },
+    "HTTPS": {
+        "fn": lambda h, p, stop: test_http_protocol(h, p or 443, tls=True, stop=stop),
+        "port": 443,
+        "note": "HTTPS GET timing/status/TLS.",
+    },
+    "FTP": {
+        "fn": lambda h, p, stop: test_ftp(h, p or 21, stop=stop),
+        "port": 21,
+        "note": "FTP banner + anonymous login attempt.",
+    },
+    "SFTP": {
+        "fn": lambda h, p, stop: test_sftp(h, p or 22, stop=stop),
+        "port": 22,
+        "note": "SSH banner check; full SFTP needs credentials/paramiko.",
+    },
+    "WebSockets": {
+        "fn": lambda h, p, stop: test_websocket(h, p, stop=stop),
+        "port": 80,
+        "note": "Use ws://host/path or wss://host/path; otherwise does Upgrade handshake.",
+    },
+    "DNS": {
+        "fn": lambda h, p, stop: test_dns_protocol(h, p or 53, stop=stop),
+        "port": 53,
+        "note": "Target format: name@resolver, e.g. example.com@8.8.8.8.",
+    },
+    "mDNS": {
+        "fn": lambda h, p, stop: test_mdns_protocol(h, p, stop=stop),
+        "port": 5353,
+        "note": "Multicast DNS discovery/listen.",
+    },
+    "LLMNR": {
+        "fn": lambda h, p, stop: test_llmnr_protocol(h, p or 5355, stop=stop),
+        "port": 5355,
+        "note": "Link-Local Multicast Name Resolution query.",
+    },
+    "DHCP": {
+        "fn": lambda h, p, stop: test_dhcp_protocol(h, p, stop=stop),
+        "port": 67,
+        "note": "DHCPDISCOVER; requires admin/root for reliable replies.",
+    },
+    "NTP": {
+        "fn": lambda h, p, stop: test_ntp_protocol(h, p or 123, stop=stop),
+        "port": 123,
+        "note": "NTP time request.",
+    },
+    "ARP": {
+        "fn": lambda h, p, stop: test_arp_protocol(h, stop=stop),
+        "port": 0,
+        "note": "ARP cache / arping if installed. Target optional IPv4.",
+    },
+    "NDP": {
+        "fn": lambda h, p, stop: test_ndp_protocol(h, stop=stop),
+        "port": 0,
+        "note": "IPv6 neighbour cache.",
+    },
+    "SMB": {
+        "fn": lambda h, p, stop: test_smb_protocol(h, p or 445, stop=stop),
+        "port": 445,
+        "note": "SMB2 negotiation probe.",
+    },
+    "NFS": {
+        "fn": lambda h, p, stop: test_nfs_protocol(h, p or 2049, stop=stop),
+        "port": 2049,
+        "note": "Checks 2049/111 and showmount if available.",
+    },
+    "SSDP": {
+        "fn": lambda h, p, stop: test_ssdp_protocol(h, p, stop=stop),
+        "port": 1900,
+        "note": "UPnP SSDP M-SEARCH.",
+    },
+    "SMTP": {
+        "fn": lambda h, p, stop: test_smtp_protocol(h, p or 25, stop=stop),
+        "port": 25,
+        "note": "SMTP banner/EHLO; use 25/587.",
+    },
+    "IMAP": {
+        "fn": lambda h, p, stop: test_imap_protocol(h, p or 143, stop=stop),
+        "port": 143,
+        "note": "IMAP banner/CAPABILITY; 993 uses TLS.",
+    },
+    "POP3": {
+        "fn": lambda h, p, stop: test_pop3_protocol(h, p or 110, stop=stop),
+        "port": 110,
+        "note": "POP3 banner/CAPA; 995 uses TLS.",
+    },
+    "SSH": {
+        "fn": lambda h, p, stop: test_ssh_protocol(h, p or 22, stop=stop),
+        "port": 22,
+        "note": "SSH banner check.",
+    },
+    "Telnet": {
+        "fn": lambda h, p, stop: test_telnet_protocol(h, p or 23, stop=stop),
+        "port": 23,
+        "note": "Telnet TCP check.",
+    },
+    "RDP": {
+        "fn": lambda h, p, stop: test_rdp_protocol(h, p or 3389, stop=stop),
+        "port": 3389,
+        "note": "RDP negotiation request.",
+    },
+    "SNMP": {
+        "fn": lambda h, p, stop: test_snmp_protocol(h, p or 161, stop=stop),
+        "port": 161,
+        "note": "SNMPv2c GET sysDescr with community public.",
+    },
+    "Syslog": {
+        "fn": lambda h, p, stop: test_syslog_protocol(h, p or 514, stop=stop),
+        "port": 514,
+        "note": "Sends test syslog; UDP has no ACK. 6514 uses TCP.",
+    },
+    "ICMP": {
+        "fn": lambda h, p, stop: test_icmp_protocol(h, stop=stop),
+        "port": 0,
+        "note": "System ping (ICMP echo).",
+    },
+    "BGP": {
+        "fn": lambda h, p, stop: test_bgp_protocol(h, p or 179, stop=stop),
+        "port": 179,
+        "note": "TCP BGP OPEN probe; use only on routers you control.",
+    },
+    "OSPF": {
+        "fn": lambda h, p, stop: test_ospf_protocol(h, p, stop=stop),
+        "port": 0,
+        "note": "Raw socket listener; requires root/admin.",
+    },
+    "EIGRP": {
+        "fn": lambda h, p, stop: test_eigrp_protocol(h, p, stop=stop),
+        "port": 0,
+        "note": "Raw socket listener; requires root/admin.",
+    },
+}
+
 def popen_kwargs() -> dict:
     kw = dict(stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
               text=True, encoding="utf-8", errors="replace", bufsize=1)
@@ -2698,6 +3899,207 @@ class PingGraphPanel(ttk.Frame):
 # ----------------------------------------------------------------------------
 # Main application
 # ----------------------------------------------------------------------------
+class ProtocolPanel(ttk.Frame):
+    """UI panel for running the added protocol tests."""
+
+    def __init__(self, master, app):
+        super().__init__(master)
+        self.app = app
+        self._stop = threading.Event()
+        self._busy = False
+
+        left = tk.Frame(self, bg=C["bg"])
+        left.pack(side="left", fill="y", padx=8, pady=8)
+
+        tk.Label(
+            left, text="Protocols", bg=C["bg"], fg=C["accent"],
+            font=(UI_FONT[0], UI_FONT[1], "bold")
+        ).pack(anchor="w")
+
+        self.listbox = tk.Listbox(
+            left, width=26, height=28,
+            bg=C["panel2"], fg=C["fg"],
+            selectbackground=C["accent"], selectforeground=C["bg"],
+            font=UI_FONT, exportselection=False,
+            relief="flat", highlightthickness=1,
+            highlightbackground=C["border"]
+        )
+        self.listbox.pack(fill="both", expand=True, pady=4)
+
+        for name in PROTOCOL_TESTS:
+            self.listbox.insert("end", name)
+
+        self.listbox.select_set(0)
+        self.listbox.bind("<<ListboxSelect>>", self._select)
+
+        right = ttk.Frame(self)
+        right.pack(side="left", fill="both", expand=True, padx=8, pady=8)
+
+        bar = tk.Frame(right, bg=C["bg"])
+        bar.grid(row=0, column=0, columnspan=2, sticky="ew")
+
+        tk.Label(bar, text="Target:", bg=C["bg"], fg=C["accent"], font=UI_FONT).pack(side="left")
+        self.target_var = tk.StringVar(value="example.com")
+        tk.Entry(
+            bar, textvariable=self.target_var, width=34,
+            bg=C["panel2"], fg=C["fg"], insertbackground=C["fg"],
+            relief="flat", font=MONO
+        ).pack(side="left", padx=6)
+
+        tk.Label(bar, text="Port:", bg=C["bg"], fg=C["dim"], font=UI_FONT).pack(side="left")
+        self.port_var = tk.StringVar(value="80")
+        tk.Entry(
+            bar, textvariable=self.port_var, width=7,
+            bg=C["panel2"], fg=C["fg"], insertbackground=C["fg"],
+            relief="flat", font=MONO
+        ).pack(side="left", padx=6)
+
+        for label, fn, col in (
+            ("▶ Run", self.run, C["accent"]),
+            ("■ Stop", self.stop, C["err"]),
+            ("Clear", self.clear, C["panel2"]),
+            ("Copy", self.copy, C["panel2"]),
+        ):
+            tk.Button(
+                bar, text=label, command=fn, bg=col,
+                fg=C["bg"] if col in (C["accent"], C["err"]) else C["fg"],
+                activebackground=C["border"], relief="flat",
+                font=UI_FONT, cursor="hand2", padx=8
+            ).pack(side="left", padx=3)
+
+        self.note_var = tk.StringVar(value="")
+        tk.Label(
+            right, textvariable=self.note_var, bg=C["bg"], fg=C["warn"],
+            font=UI_FONT, anchor="w"
+        ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+
+        self.out = tk.Text(
+            right, bg=C["bg"], fg=C["fg"], insertbackground=C["fg"],
+            font=MONO, relief="flat", wrap="none", padx=8, pady=6
+        )
+        ys = ttk.Scrollbar(right, orient="vertical", command=self.out.yview)
+        xs = ttk.Scrollbar(right, orient="horizontal", command=self.out.xview)
+        self.out.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
+
+        self.out.grid(row=2, column=0, sticky="nsew")
+        ys.grid(row=2, column=1, sticky="ns")
+        xs.grid(row=3, column=0, sticky="ew")
+
+        right.rowconfigure(2, weight=1)
+        right.columnconfigure(0, weight=1)
+
+        self.out.tag_configure("cmd", foreground=C["cmd"], font=(MONO[0], MONO[1], "bold"))
+        self.out.tag_configure("ok", foreground=C["ok"])
+        self.out.tag_configure("warn", foreground=C["warn"])
+        self.out.tag_configure("err", foreground=C["err"], font=(MONO[0], MONO[1], "bold"))
+        self.out.tag_configure("info", foreground=C["dim"])
+        self.out.tag_configure("head", foreground=C["head"])
+
+        self.after(50, self._select)
+
+    def _select(self, event=None):
+        sel = self.listbox.curselection()
+        if not sel:
+            return
+        name = self.listbox.get(sel[0])
+        meta = PROTOCOL_TESTS.get(name, {})
+        port = meta.get("port")
+        self.port_var.set("" if not port else str(port))
+        self.note_var.set(meta.get("note", ""))
+
+    def select_protocol(self, name):
+        names = list(PROTOCOL_TESTS.keys())
+        if name not in names:
+            return
+        idx = names.index(name)
+        self.listbox.select_clear(0, "end")
+        self.listbox.select_set(idx)
+        self.listbox.see(idx)
+        self._select()
+
+    def write(self, line, tag="head"):
+        self.out.insert("end", line + "\n", tag)
+        self.out.see("end")
+
+    def write_safe(self, line, tag="head"):
+        try:
+            self.after(0, lambda: self.write(line, tag))
+        except Exception:
+            pass
+
+    def clear(self):
+        self.out.delete("1.0", "end")
+
+    def copy(self):
+        try:
+            sel = self.out.get("sel.first", "sel.last")
+        except Exception:
+            sel = self.out.get("1.0", "end")
+        self.clipboard_clear()
+        self.clipboard_append(sel)
+        self.app.status("protocol output copied to clipboard")
+
+    def stop(self):
+        self._stop.set()
+        self.write_safe("■ stop requested", "warn")
+
+    def run(self):
+        if self._busy:
+            self.app.status("protocol test already running")
+            return
+
+        sel = self.listbox.curselection() or (0,)
+        name = self.listbox.get(sel[0])
+        meta = PROTOCOL_TESTS[name]
+
+        target = self.target_var.get().strip() or "example.com"
+        port_raw = self.port_var.get().strip()
+
+        try:
+            port = int(port_raw) if port_raw else int(meta.get("port") or 0)
+        except Exception:
+            port = int(meta.get("port") or 0)
+
+        self._stop.clear()
+        self._busy = True
+
+        self.write("─" * 78, "info")
+        self.write(f"[{now()}] protocol test: {name} target={target or '-'} port={port or '-'}", "cmd")
+
+        threading.Thread(target=self._work, args=(name, target, port), daemon=True).start()
+
+    def _work(self, name, target, port):
+        meta = PROTOCOL_TESTS[name]
+        fn = meta["fn"]
+
+        try:
+            res = fn(target, port, self._stop)
+            if not isinstance(res, dict):
+                res = {"ok": bool(res), "result": res}
+
+            res.setdefault("protocol", name)
+            ok = bool(res.get("ok"))
+
+            self.write_safe(f"RESULT: {'PASS' if ok else 'FAIL'}", "ok" if ok else "err")
+
+            if res.get("summary"):
+                self.write_safe(f"summary: {res['summary']}", "warn")
+
+            if res.get("error"):
+                self.write_safe(f"error: {res['error']}", "err")
+
+            for k, v in res.items():
+                if k in ("ok", "summary", "error"):
+                    continue
+                self.write_safe(f"{k}: {_short_text(v, 220)}", "head")
+
+        except Exception as e:
+            self.write_safe("RESULT: FAIL", "err")
+            self.write_safe(f"error: {e}", "err")
+        finally:
+            self._busy = False
+            self.write_safe(f"✔ {name} test finished", "ok")
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -2867,6 +4269,9 @@ class App(tk.Tk):
         action("Long-Run Logger CSV  Ctrl+Shift+N", self.run_longrun)
         action("Report Generator     Ctrl+Shift+O", self.run_report)
 
+        section("PROTOCOL TESTS")
+        action("Protocol Test Panel", self.show_protocols)
+
         section("CUSTOM COMMAND")
         self.custom_var = tk.StringVar(value="netstat -an")
         tk.Entry(side_in, textvariable=self.custom_var, bg=C["panel2"], fg=C["fg"],
@@ -2902,6 +4307,9 @@ class App(tk.Tk):
 
         self.matrix = MatrixPanel(self.nb, self)
         self.nb.add(self.matrix, text="  Multi-Host Matrix  ")
+
+        self.protocols = ProtocolPanel(self.nb, self)
+        self.nb.add(self.protocols, text="  Protocol Tests  ")
 
         # status bar
         self.status_var = tk.StringVar(value="ready")
@@ -3595,6 +5003,14 @@ class App(tk.Tk):
     # -- tabs ---------------------------------------------------------------
     def show_matrix(self):
         self.nb.select(self.matrix)
+
+    def show_protocols(self):
+        self.nb.select(self.protocols)
+
+    def quick_protocol(self, name):
+        self.show_protocols()
+        self.protocols.select_protocol(name)
+        self.protocols.run()
 
     def show_pinggraph(self):
         self.nb.select(self.pinggraph)
