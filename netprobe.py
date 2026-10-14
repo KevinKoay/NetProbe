@@ -10,6 +10,8 @@ One portable app for Windows / macOS / Linux laptops:
   * Live multi-interface traffic charts (upload / download per NIC)
   * Active connection analyzer (per-process sockets)
   * Multi-host matrix: probe many hosts at once, compare latency/loss
+  * Switchable colour themes (8 palettes: dark, light, high-contrast …)
+  * Animated UI: typewriter intro, hover effects, spinners, progress bars
 
 No installation needed beyond Python 3.8+.
 Optional:  pip install psutil   (richer traffic + connection data)
@@ -23,6 +25,8 @@ import os
 import re
 import ssl
 import sys
+import json
+import math
 import time
 import queue
 import socket
@@ -34,12 +38,6 @@ import urllib.error
 import threading
 from collections import deque
 from urllib.parse import urlparse
-
-import struct
-import random
-import uuid
-import base64
-import hashlib
 
 try:
     import tkinter as tk
@@ -88,8 +86,10 @@ IS_MAC = platform.system() == "Darwin"
 IS_NIX = not IS_WIN and not IS_MAC
 
 # ----------------------------------------------------------------------------
-# Theme
+# Theme engine
 # ----------------------------------------------------------------------------
+# "C" always holds the colours currently on screen.  Switching themes morphs
+# every widget smoothly from the old palette to the new one (App.apply_theme).
 C = {
     "bg":        "#101418",
     "panel":     "#171d24",
@@ -107,8 +107,235 @@ C = {
     "tx":        "#f2994a",
 }
 
+THEMES = {
+    "Midnight": dict(C),
+    "Dracula": {
+        "bg": "#282a36", "panel": "#21222c", "panel2": "#343746",
+        "border": "#44475a", "fg": "#f8f8f2", "dim": "#6272a4",
+        "accent": "#bd93f9", "ok": "#50fa7b", "warn": "#f1fa8c",
+        "err": "#ff5555", "cmd": "#8be9fd", "head": "#c9cdd8",
+        "rx": "#50fa7b", "tx": "#ffb86c",
+    },
+    "Nord": {
+        "bg": "#2e3440", "panel": "#3b4252", "panel2": "#434c5e",
+        "border": "#4c566a", "fg": "#eceff4", "dim": "#7b88a1",
+        "accent": "#88c0d0", "ok": "#a3be8c", "warn": "#ebcb8b",
+        "err": "#bf616a", "cmd": "#8fbcbb", "head": "#d8dee6",
+        "rx": "#a3be8c", "tx": "#d08770",
+    },
+    "Solarized Dark": {
+        "bg": "#002b36", "panel": "#073642", "panel2": "#0a4552",
+        "border": "#1f5c68", "fg": "#93a1a1", "dim": "#586e75",
+        "accent": "#268bd2", "ok": "#859900", "warn": "#b58900",
+        "err": "#dc322f", "cmd": "#2aa198", "head": "#839496",
+        "rx": "#859900", "tx": "#cb4b16",
+    },
+    "Monokai": {
+        "bg": "#272822", "panel": "#2f3027", "panel2": "#3b3c32",
+        "border": "#49483e", "fg": "#f8f8f2", "dim": "#75715e",
+        "accent": "#66d9ef", "ok": "#a6e22e", "warn": "#e6db74",
+        "err": "#f92672", "cmd": "#a1efe4", "head": "#b8b8b2",
+        "rx": "#a6e22e", "tx": "#fd971f",
+    },
+    "Gruvbox Dark": {
+        "bg": "#282828", "panel": "#32302f", "panel2": "#3c3836",
+        "border": "#504945", "fg": "#ebdbb2", "dim": "#928374",
+        "accent": "#83a598", "ok": "#b8bb26", "warn": "#fabd2f",
+        "err": "#fb4934", "cmd": "#8ec07c", "head": "#d5c4a1",
+        "rx": "#b8bb26", "tx": "#fe8019",
+    },
+    "Light": {
+        "bg": "#f4f6f8", "panel": "#ffffff", "panel2": "#e8ecf1",
+        "border": "#c7d0d9", "fg": "#1c2733", "dim": "#5b6b7a",
+        "accent": "#0a66c2", "ok": "#1a7f37", "warn": "#9a6700",
+        "err": "#cf222e", "cmd": "#0a66c2", "head": "#334155",
+        "rx": "#1a7f37", "tx": "#bc4c00",
+    },
+    "High Contrast": {
+        "bg": "#000000", "panel": "#0a0a0a", "panel2": "#161616",
+        "border": "#ffffff", "fg": "#ffffff", "dim": "#d0d0d0",
+        "accent": "#00e5ff", "ok": "#00ff85", "warn": "#ffe600",
+        "err": "#ff3b3b", "cmd": "#7df9ff", "head": "#e8e8e8",
+        "rx": "#00ff85", "tx": "#ffb300",
+    },
+}
+THEME_NAMES = list(THEMES.keys())
+DEFAULT_THEME = "Midnight"
+
 MONO = ("Consolas", 10) if IS_WIN else ("Menlo", 11)
 UI_FONT = ("Segoe UI", 9) if IS_WIN else ("Helvetica Neue", 12)
+
+
+# ----------------------------------------------------------------------------
+# Colour helpers + animation utilities
+# ----------------------------------------------------------------------------
+def hex_to_rgb(h):
+    h = (h or "").lstrip("#")
+    if len(h) != 6:
+        return None
+    try:
+        return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return None
+
+
+def rgb_to_hex(rgb):
+    return "#{:02x}{:02x}{:02x}".format(
+        *(max(0, min(255, int(round(v)))) for v in rgb))
+
+
+def lerp_color(a, b, t):
+    """Blend colour a towards colour b (t in 0..1).  Unknown names pass through."""
+    ra, rb = hex_to_rgb(a), hex_to_rgb(b)
+    if ra is None or rb is None:
+        return b
+    return rgb_to_hex(tuple(ra[i] + (rb[i] - ra[i]) * t for i in range(3)))
+
+
+def blend(fg, bg, alpha):
+    """Composite fg over bg — used for soft chart fills and glows."""
+    return lerp_color(bg, fg, max(0.0, min(1.0, alpha)))
+
+
+def lighter(col, f=0.16):
+    return lerp_color(col, "#ffffff", f)
+
+
+SPIN_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+
+def render_bar(frac, width=22):
+    frac = max(0.0, min(1.0, float(frac)))
+    n = int(round(frac * width))
+    return "█" * n + "░" * (width - n)
+
+
+def _theme_config_path():
+    try:
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "netprobe_theme.json")
+    except Exception:
+        return "netprobe_theme.json"
+
+
+def load_theme_name():
+    try:
+        with open(_theme_config_path(), "r", encoding="utf-8") as f:
+            name = json.load(f).get("theme", "")
+        return name if name in THEMES else DEFAULT_THEME
+    except Exception:
+        return DEFAULT_THEME
+
+
+def save_theme_name(name):
+    try:
+        with open(_theme_config_path(), "w", encoding="utf-8") as f:
+            json.dump({"theme": name}, f)
+    except Exception:
+        pass
+
+
+def attach_hover(widget, base_bg, base_fg=None, lift=0.16):
+    """Buttons fade to a lighter shade on hover — colours follow the theme."""
+    widget._hover_cfg = {"bg": base_bg, "fg": base_fg, "lift": lift}
+    state = {"job": None}
+
+    def go(target_bg, target_fg):
+        if state["job"] is not None:
+            try:
+                widget.after_cancel(state["job"])
+            except Exception:
+                pass
+            state["job"] = None
+        try:
+            start_bg = widget.cget("bg")
+            start_fg = widget.cget("fg")
+        except Exception:
+            return
+        steps, ms = 5, 14
+
+        def tick(i=0):
+            state["job"] = None
+            try:
+                if not widget.winfo_exists():
+                    return
+                t = i / steps
+                widget.configure(bg=lerp_color(start_bg, target_bg, t))
+                if target_fg:
+                    widget.configure(fg=lerp_color(start_fg, target_fg, t))
+                if i < steps:
+                    state["job"] = widget.after(ms, tick, i + 1)
+            except Exception:
+                pass
+
+        tick()
+
+    def enter(_e):
+        cfg = getattr(widget, "_hover_cfg", {})
+        base = cfg.get("bg", base_bg)
+        go(lighter(base, cfg.get("lift", 0.16)), cfg.get("fg"))
+
+    def leave(_e):
+        cfg = getattr(widget, "_hover_cfg", {})
+        go(cfg.get("bg", base_bg), cfg.get("fg"))
+
+    try:
+        widget.bind("<Enter>", enter, add="+")
+        widget.bind("<Leave>", leave, add="+")
+    except Exception:
+        pass
+
+
+def recolor_widget_tree(root, old2new):
+    """Translate every colour attribute/tag found under root through old2new."""
+    stack = [root]
+    while stack:
+        w = stack.pop()
+        try:
+            stack.extend(w.winfo_children())
+        except Exception:
+            pass
+        try:
+            if not w.winfo_exists():
+                continue
+        except Exception:
+            continue
+        for attr in ("bg", "background", "fg", "foreground", "insertbackground",
+                     "activebackground", "activeforeground", "selectbackground",
+                     "selectforeground", "highlightbackground", "highlightcolor",
+                     "troughcolor", "bordercolor", "arrowcolor", "fieldbackground",
+                     "disabledforeground"):
+            try:
+                cur = w.cget(attr)
+            except Exception:
+                continue
+            if isinstance(cur, str) and cur.lower() in old2new:
+                try:
+                    w.configure(**{attr: old2new[cur.lower()]})
+                except Exception:
+                    pass
+        # hover-animation base colours ride along with the theme
+        cfg = getattr(w, "_hover_cfg", None)
+        if isinstance(cfg, dict):
+            for k in ("bg", "fg"):
+                v = cfg.get(k)
+                if isinstance(v, str) and v.lower() in old2new:
+                    cfg[k] = old2new[v.lower()]
+        # text-widget tags (terminal colours)
+        try:
+            if hasattr(w, "tag_names"):
+                for tag in w.tag_names():
+                    try:
+                        fg = w.tag_cget(tag, "foreground")
+                    except Exception:
+                        fg = ""
+                    if isinstance(fg, str) and fg.lower() in old2new:
+                        try:
+                            w.tag_configure(tag, foreground=old2new[fg.lower()])
+                        except Exception:
+                            pass
+        except Exception:
+            pass
 
 
 # ----------------------------------------------------------------------------
@@ -243,7 +470,6 @@ def http_probe(url: str, timeout: float = 10.0) -> dict:
         for line in head.split("\r\n")[1:]:
             if ":" in line:
                 k, v = line.split(":", 1)
-                out.setdefault("headers", {})[k.strip().lower()] = v.strip()
                 if k.strip().lower() in ("server", "content-type", "via", "cf-ray"):
                     out[k.strip().lower()] = v.strip()
     except Exception as e:
@@ -260,11 +486,12 @@ def http_probe(url: str, timeout: float = 10.0) -> dict:
 
 
 def speed_test(down_bytes: int = 10_000_000, up_bytes: int = 5_000_000,
-               timeout: float = 90.0, emit=None) -> dict:
+               timeout: float = 90.0, emit=None, progress=None) -> dict:
     """
     Bandwidth estimate against Cloudflare's public speed endpoint.
     Measures download, upload, latency and jitter. No data is uploaded
     other than anonymous filler bytes.
+    progress(frac, label) — optional animated progress callback.
     """
     res = {}
     def say(t):
@@ -293,12 +520,19 @@ def speed_test(down_bytes: int = 10_000_000, up_bytes: int = 5_000_000,
             headers={"User-Agent": f"{APP_NAME}/{VERSION}", "Cache-Control": "no-cache"})
         with urllib.request.urlopen(req, timeout=timeout) as r:
             got = 0
+            last_ui = 0.0
             while True:
                 chunk = r.read(262144)
                 if not chunk:
                     break
                 got += len(chunk)
+                if progress and (time.perf_counter() - last_ui) > 0.15:
+                    last_ui = time.perf_counter()
+                    progress(min(1.0, got / max(1, down_bytes)),
+                             f"downloaded {fmt_bytes(got)} / {fmt_bytes(down_bytes)}")
         dt = time.perf_counter() - t0
+        if progress:
+            progress(1.0, f"download complete — {fmt_bytes(got)}")
         res["down_bytes"] = got
         res["down_sec"] = dt
         res["down_mbps"] = got * 8 / dt / 1e6
@@ -306,6 +540,8 @@ def speed_test(down_bytes: int = 10_000_000, up_bytes: int = 5_000_000,
         res["down_error"] = str(e)
 
     say(f"  upload {fmt_bytes(up_bytes)} ...")
+    if progress:
+        progress(0.0, f"uploading {fmt_bytes(up_bytes)} …")
     t0 = time.perf_counter()
     try:
         payload = b"\x00" * up_bytes
@@ -318,6 +554,8 @@ def speed_test(down_bytes: int = 10_000_000, up_bytes: int = 5_000_000,
         res["up_bytes"] = up_bytes
         res["up_sec"] = dt
         res["up_mbps"] = up_bytes * 8 / dt / 1e6
+        if progress:
+            progress(1.0, f"upload complete — {res['up_mbps']:.2f} Mbps")
     except Exception as e:
         res["up_error"] = str(e)
     return res
@@ -545,23 +783,7 @@ def parse_dns_message(data: bytes) -> dict:
                 val = socket.inet_ntop(socket.AF_INET6, rdata)
             elif rtype in (12, 2, 5, 33):            # PTR / NS / CNAME / SRV target
                 val = _dns_name(data, rstart)[0]
-            elif rtype == 15 and rdlen >= 3:            # MX
-                pref = struct.unpack(">H", rdata[:2])[0]
-                val = f"{pref} {_dns_name(data, rstart + 2)[0]}"
-            elif rtype == 6:                             # SOA
-                mname, off2 = _dns_name(data, rstart)
-                rname, off2 = _dns_name(data, off2)
-                if off2 + 20 <= len(data):
-                    serial, refresh, retry_, expire, minimum = struct.unpack(
-                        ">IIIII", data[off2:off2 + 20])
-                    val = (f"{mname} {rname} serial={serial} refresh={refresh} "
-                           f"retry={retry_} expire={expire} minimum={minimum}")
-            elif rtype == 257 and rdlen >= 2:           # CAA
-                taglen = rdata[1]
-                tag = rdata[2:2 + taglen].decode("utf-8", "replace")
-                value = rdata[2 + taglen:].decode("utf-8", "replace")
-                val = f"{tag}={value}"
-            elif rtype == 16:                           # TXT
+            elif rtype == 16:                         # TXT
                 chunks, i = [], 0
                 while i < len(rdata):
                     ln = rdata[i]
@@ -1246,1723 +1468,8 @@ def route_watch(emit, host: str, rounds: int = 4, interval: float = 25.0, stop=N
 
 
 # ----------------------------------------------------------------------------
-# Professional toolkit: TLS, DNS records, latency stats, TCP health, ECMP,
-# Wi-Fi survey, link watch, VPN report, long-run logger, report generator
-# ----------------------------------------------------------------------------
-
-def tls_inspect(host: str, port: int = 443, timeout: float = 8.0) -> dict:
-    """TLS certificate & handshake inspection (expiry, issuer, SAN, cipher)."""
-    out = {"host": host, "port": port}
-    try:
-        addrs, ms = dns_resolve(host)
-        out["ip"] = addrs[0]
-        out["dns_ms"] = ms
-    except Exception as e:
-        out["error"] = f"DNS: {e}"
-        return out
-    target = out.get("ip", host)
-    ctx = ssl.create_default_context()
-    t0 = time.perf_counter()
-    try:
-        try:
-            raw = socket.create_connection((target, port), timeout)
-            ssock = ctx.wrap_socket(raw, server_hostname=host)
-            out["verified"] = True
-        except ssl.SSLCertVerificationError as e:
-            raw = socket.create_connection((target, port), timeout)
-            ssock = ssl._create_unverified_context().wrap_socket(raw, server_hostname=host)
-            out["verified"] = False
-            out["verify_error"] = str(e)
-        out["handshake_ms"] = (time.perf_counter() - t0) * 1000.0
-        out["protocol"] = ssock.version()
-        cipher = ssock.cipher()
-        out["cipher"] = cipher[0] if cipher else "?"
-        cert = ssock.getpeercert() or {}
-        out["subject"] = dict(x[0] for x in cert.get("subject", ()))
-        out["issuer"] = dict(x[0] for x in cert.get("issuer", ()))
-        out["not_before"] = cert.get("notBefore")
-        out["not_after"] = cert.get("notAfter")
-        out["serial"] = cert.get("serialNumber")
-        out["sans"] = [v for _t, v in cert.get("subjectAltName", ())][:12]
-        if out.get("not_after"):
-            try:
-                exp = datetime.datetime.strptime(out["not_after"], "%b %d %H:%M:%S %Y %Z")
-                out["days_left"] = (exp - datetime.datetime.utcnow()).days
-            except Exception:
-                pass
-        ssock.close()
-    except Exception as e:
-        out["error"] = str(e)
-    return out
-
-
-def dns_records(name: str, resolver: str = "1.1.1.1") -> list:
-    """Full record browser: A/AAAA/CNAME/MX/NS/TXT/SOA/CAA with TTL."""
-    types = [("A", 1), ("AAAA", 28), ("CNAME", 5), ("MX", 15), ("NS", 2),
-             ("TXT", 16), ("SOA", 6), ("CAA", 257)]
-    rows = []
-    for tname, code in types:
-        try:
-            _ms, pkt = dns_query(resolver, name, qtype=code, timeout=3.5)
-            if pkt.get("rcode") != 0:
-                rc = {1: "FORMERR", 2: "SERVFAIL", 3: "NXDOMAIN", 5: "REFUSED"}.get(
-                    pkt.get("rcode"), f"rcode {pkt.get('rcode')}")
-                rows.append((tname, name, f"({rc})", 0))
-                continue
-            got = 0
-            for rn, rt, ttl, val in pkt.get("answers", []):
-                if rt == code:
-                    rows.append((tname, rn, val, ttl))
-                    got += 1
-            if not got:
-                rows.append((tname, name, "(no records)", 0))
-        except Exception as e:
-            rows.append((tname, name, f"error: {e}", 0))
-    return rows
-
-
-def latency_stats(emit, host: str, samples: int = 50, interval: float = 0.2,
-                  port=None, stop=None) -> dict:
-    """Professional latency profile: min/avg/max/stdev + percentiles + loss."""
-    vals = []
-    emit(f"  sampling {host} × {samples} probes @ {interval}s …")
-    for i in range(samples):
-        if stop is not None and stop.is_set():
-            break
-        ms = probe_latency(host, port)
-        vals.append(ms)
-        emit(f"  [{i + 1:3d}/{samples}] {'timeout' if ms is None else f'{ms:7.2f} ms'}")
-        time.sleep(interval)
-    ok = sorted(v for v in vals if v is not None)
-    stats = {"sent": len(vals), "received": len(ok),
-             "loss": 100.0 * (len(vals) - len(ok)) / max(1, len(vals))}
-    if ok:
-        import statistics
-
-        def pct(p):
-            return ok[min(len(ok) - 1, int(round(p / 100 * (len(ok) - 1))))]
-        stats.update({"min": ok[0], "avg": sum(ok) / len(ok), "max": ok[-1],
-                      "stdev": statistics.stdev(ok) if len(ok) > 1 else 0.0,
-                      "p50": pct(50), "p90": pct(90), "p95": pct(95), "p99": pct(99)})
-        emit("  ── latency profile ──")
-        emit(f"  min {stats['min']:.2f}  avg {stats['avg']:.2f}  max {stats['max']:.2f}  "
-             f"stdev {stats['stdev']:.2f} ms")
-        emit(f"  p50 {stats['p50']:.2f}  p90 {stats['p90']:.2f}  "
-             f"p95 {stats['p95']:.2f}  p99 {stats['p99']:.2f} ms")
-        emit(f"  loss {stats['loss']:.1f}%   ({stats['received']}/{stats['sent']} replies)")
-        # histogram
-        lo, hi = ok[0], max(ok[-1], ok[0] + 1e-6)
-        buckets = [0] * 10
-        for v in ok:
-            buckets[min(9, int((v - lo) / (hi - lo) * 10))] += 1
-        emit("  distribution:")
-        for i, b in enumerate(buckets):
-            a = lo + (hi - lo) * i / 10
-            emit(f"    {a:7.1f}-{lo + (hi - lo) * (i + 1) / 10:7.1f} ms | "
-                 f"{'█' * int(40 * b / max(1, max(buckets)))} {b}")
-    else:
-        emit("  all probes failed — no statistics")
-    return stats
-
-
-def tcp_state_analyze(emit) -> dict:
-    """TCP socket state distribution + transport counters from netstat -s."""
-    counts = {}
-    total = 0
-    if HAVE_PSUTIL:
-        try:
-            for c in psutil.net_connections(kind="inet"):
-                counts[c.status] = counts.get(c.status, 0) + 1
-                total += 1
-        except Exception:
-            pass
-    if counts:
-        emit(f"  socket states ({total} sockets):")
-        for st, n in sorted(counts.items(), key=lambda kv: -kv[1]):
-            emit(f"    {st:14s} {n:6d}")
-        if counts.get("CLOSE_WAIT", 0) > 20:
-            emit("  ⚠ CLOSE_WAIT high — applications not closing sockets (leak?)")
-        if counts.get("SYN_SENT", 0) > 5:
-            emit("  ⚠ SYN_SENT high — outbound connects failing / filtered")
-        if counts.get("TIME_WAIT", 0) > 500:
-            emit("  ⚠ TIME_WAIT very high — churn or short connection reuse")
-        if counts.get("LISTEN", 0) == 0:
-            emit("  ⚠ no LISTEN sockets — unexpected on a workstation")
-    else:
-        emit("  (socket states need psutil — pip install psutil)")
-    emit("  transport counters (netstat -s):")
-    try:
-        r = subprocess.run(["netstat", "-s"], capture_output=True, text=True, timeout=20,
-                           **{k: v for k, v in popen_kwargs().items() if k == "creationflags"})
-        keys = ("retransmission", "reset", "out-of-order", "bad checksum",
-                "listen queue", "overflow", "duplicate", "error", "timeout",
-                "failed", "dropped", "fragment")
-        shown = 0
-        for line in (r.stdout or "").splitlines():
-            low = line.lower()
-            if any(k in low for k in keys) and re.search(r"\d", line):
-                emit(f"    {line.strip()}")
-                shown += 1
-                if shown >= 18:
-                    break
-        if not shown:
-            emit("    (no counters matched — platform dependent)")
-    except Exception as e:
-        emit(f"    netstat -s failed: {e}")
-    return counts
-
-
-def ecmp_trace(emit, host: str, rounds: int = 3, interval: float = 4.0, stop=None) -> dict:
-    """ECMP / load-balancing & path-flap detector: repeated traceroute comparison."""
-    paths = []
-    for i in range(rounds):
-        if stop is not None and stop.is_set():
-            break
-        emit(f"  ── traceroute round {i + 1}/{rounds} ──")
-        hops = []
-        try:
-            r = subprocess.run(cmd_trace(host), capture_output=True, text=True, timeout=120,
-                               **{k: v for k, v in popen_kwargs().items() if k == "creationflags"})
-            cur_hop, cur_ips = None, set()
-            for line in (r.stdout or "").splitlines():
-                m = re.match(r"\s*(\d+)\s", line)
-                ips = re.findall(r"\d+\.\d+\.\d+\.\d+", line)
-                if m:
-                    if cur_hop is not None:
-                        hops.append((cur_hop, cur_ips))
-                    cur_hop, cur_ips = int(m.group(1)), set(ips)
-                elif cur_hop is not None:
-                    cur_ips.update(ips)
-            if cur_hop is not None:
-                hops.append((cur_hop, cur_ips))
-            emit("  hops: " + " -> ".join(
-                ("/".join(sorted(ips)) if ips else "*") for _n, ips in hops[:14]))
-        except Exception as e:
-            emit(f"  traceroute failed: {e}")
-        if hops:
-            paths.append(hops)
-        if i < rounds - 1:
-            time.sleep(interval)
-
-    report = {"load_balanced": [], "changed": []}
-    if len(paths) >= 2:
-        max_hops = max(len(p) for p in paths)
-        emit("  ── path comparison ──")
-        for idx in range(max_hops):
-            seen = set()
-            for p in paths:
-                if idx < len(p):
-                    seen |= p[idx][1]
-            if len(seen) > 1:
-                report["load_balanced"].append((idx + 1, sorted(seen)))
-                emit(f"  hop {idx + 1}: LOAD-BALANCED across {' / '.join(sorted(seen))}")
-            elif seen:
-                emit(f"  hop {idx + 1}: {sorted(seen)[0]}  (stable)")
-        first = [ips for _n, ips in paths[0]]
-        for other in paths[1:]:
-            if [ips for _n, ips in other] != first:
-                report["changed"].append(True)
-        if report["changed"]:
-            emit("  ⚠ PATH FLAP — route differs between rounds (check ECMP/bonding/VPN)")
-        else:
-            emit("  path stable across rounds")
-    return report
-
-
-def wifi_channel_survey() -> list:
-    """Nearby APs: (ssid, bssid, channel, signal)."""
-    rows = []
-    try:
-        if IS_WIN:
-            r = subprocess.run(["netsh", "wlan", "show", "networks", "mode=bssid"],
-                               capture_output=True, text=True, timeout=15,
-                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            cur = {}
-            for line in (r.stdout or "").splitlines():
-                line = line.strip()
-                if line.startswith("SSID ") and "BSSID" not in line:
-                    cur["ssid"] = line.split(":", 1)[1].strip()
-                elif line.startswith("BSSID"):
-                    cur["bssid"] = line.split(":", 1)[1].strip()
-                elif line.startswith("Signal"):
-                    cur["signal"] = line.split(":", 1)[1].strip()
-                elif line.startswith("Channel"):
-                    cur["channel"] = line.split(":", 1)[1].strip()
-                    rows.append((cur.get("ssid", ""), cur.get("bssid", ""),
-                                 cur.get("channel", ""), cur.get("signal", "")))
-                    cur = {}
-        elif IS_MAC:
-            airport = ("/System/Library/PrivateFrameworks/Apple80211.framework/"
-                       "Versions/Current/Resources/airport")
-            if os.path.exists(airport):
-                r = subprocess.run([airport, "-s"], capture_output=True, text=True, timeout=20)
-                for line in (r.stdout or "").splitlines()[1:]:
-                    m = re.match(r"\s*(.+?)\s+([0-9a-f:]{17})\s+(-?\d+)\s+.*?\s(\d+|[0-9]+,[0-9]+)\s", line)
-                    if m:
-                        rows.append((m.group(1).strip(), m.group(2), m.group(4), m.group(3)))
-        else:
-            r = subprocess.run(["nmcli", "-t", "-f", "SSID,BSSID,CHAN,SIGNAL", "dev", "wifi", "list"],
-                               capture_output=True, text=True, timeout=20)
-            for line in (r.stdout or "").splitlines():
-                p = line.split(":")
-                if len(p) >= 4:
-                    rows.append((p[0], p[1], p[2], p[3]))
-    except Exception:
-        pass
-    return rows
-
-
-def wifi_survey_report(emit) -> list:
-    rows = wifi_channel_survey()
-    if not rows:
-        emit("  no scan data — Wi-Fi scan unavailable on this platform/permission set")
-        return []
-    emit(f"  {'SSID':<24}{'BSSID':<20}{'CH':<6}{'SIGNAL':<8}")
-    for ssid, bssid, ch, sig in sorted(rows, key=lambda r: -(int(r[3]) if str(r[3]).isdigit() else 0)):
-        emit(f"  {ssid[:23]:<24}{bssid[:19]:<20}{str(ch)[:5]:<6}{str(sig)[:7]:<8}")
-    per_ch = {}
-    for _s, _b, ch, _sig in rows:
-        key = str(ch).split(",")[0]
-        per_ch[key] = per_ch.get(key, 0) + 1
-    emit("  channel utilisation:")
-    for ch in sorted(per_ch, key=lambda c: per_ch[c]):
-        emit(f"    ch {ch:>4}: {'█' * per_ch[ch]} {per_ch[ch]} AP(s)")
-    crowded = {c: n for c, n in per_ch.items() if c in ("1", "6", "11")}
-    if crowded:
-        best = min(crowded, key=lambda c: crowded[c])
-        emit(f"  least congested of 1/6/11 → channel {best}")
-    return rows
-
-
-def link_watch(emit, seconds: float = 60.0, interval: float = 3.0, stop=None):
-    """Watch NIC link state / speed / MTU transitions."""
-    def snap():
-        out = {}
-        if HAVE_PSUTIL:
-            try:
-                for name, s in psutil.net_if_stats().items():
-                    out[name] = (s.isup, s.speed, s.mtu)
-            except Exception:
-                pass
-        return out
-
-    prev = snap()
-    emit(f"  baseline: {len(prev)} interfaces")
-    for n, (up, speed, mtu) in sorted(prev.items()):
-        emit(f"    {n:22s} {'UP  ' if up else 'DOWN'}  {speed or '?'} Mb/s  mtu {mtu}")
-    end = time.time() + seconds
-    while time.time() < end:
-        if stop is not None and stop.is_set():
-            break
-        time.sleep(interval)
-        cur = snap()
-        for n, v in cur.items():
-            if n in prev and v != prev[n]:
-                emit(f"  [{now()}] ⚠ {n}: {prev[n]} -> {v}")
-            elif n not in prev:
-                emit(f"  [{now()}] + {n} appeared  {v}")
-        for n in prev:
-            if n not in cur:
-                emit(f"  [{now()}] − {n} disappeared")
-        prev = cur
-    emit(f"  [{now()}] link watch finished")
-
-
-def vpn_report(emit) -> dict:
-    """Interfaces, routes, DNS, public IP + split-tunnel / VPN hints."""
-    out = {"vpn_ifaces": []}
-    emit("  interfaces:")
-    if HAVE_PSUTIL:
-        try:
-            addrs = psutil.net_if_addrs()
-            stats = psutil.net_if_stats()
-            for name, alist in addrs.items():
-                ips = [a.address for a in alist if a.family in (socket.AF_INET, socket.AF_INET6)]
-                st = stats.get(name)
-                flag = ""
-                if re.search(r"tun|utun|tap|ppp|wg|vpn|ipsec|cisco|anyconnect|gpd", name, re.I):
-                    flag = "  <— VPN-like"
-                    out["vpn_ifaces"].append(name)
-                emit(f"    {name:22s} {'UP' if st and st.isup else '??'}  "
-                     f"{', '.join(ips[:2]) or '-'}{flag}")
-        except Exception:
-            pass
-    else:
-        emit("    (install psutil for interface details)")
-    emit("  routes (first 12):")
-    try:
-        r = subprocess.run(cmd_routes(), capture_output=True, text=True, timeout=15,
-                           **{k: v for k, v in popen_kwargs().items() if k == "creationflags"})
-        lines = [ln for ln in (r.stdout or "").splitlines() if ln.strip()][:12]
-        for ln in lines:
-            emit(f"    {ln}")
-        defaults = [ln for ln in (r.stdout or "").splitlines()
-                    if re.match(r"^(0\.0\.0\.0|default|Default)", ln.strip())]
-        if len(defaults) > 1:
-            emit(f"  ⚠ {len(defaults)} default routes — likely split-tunnel / multi-homed")
-    except Exception as e:
-        emit(f"    route read failed: {e}")
-    emit(f"  public IP: {public_ip()}")
-    dns = []
-    try:
-        if IS_WIN:
-            r = subprocess.run(["ipconfig", "/all"], capture_output=True, text=True, timeout=15,
-                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            dns = re.findall(r"DNS Servers[^:]*:\s*(.+)", r.stdout or "")
-        elif IS_MAC:
-            r = subprocess.run(["scutil", "--dns"], capture_output=True, text=True, timeout=10)
-            dns = re.findall(r"nameserver\[\d+\]\s*:\s*(\S+)", r.stdout or "")
-        elif os.path.exists("/etc/resolv.conf"):
-            with open("/etc/resolv.conf") as f:
-                dns = re.findall(r"nameserver\s+(\S+)", f.read())
-    except Exception:
-        pass
-    out["dns"] = sorted(set(dns))[:6]
-    emit(f"  DNS servers: {', '.join(out['dns']) or 'unknown'}")
-    if out["vpn_ifaces"]:
-        emit(f"  verdict: VPN interface(s) present — {', '.join(out['vpn_ifaces'])}")
-    else:
-        emit("  verdict: no obvious VPN interface detected")
-    return out
-
-
-def longrun_logger(emit, host: str, minutes: float = 10.0, interval: float = 5.0,
-                   stop=None) -> dict:
-    """CSV logger for intermittent issues: latency + throughput over time."""
-    path = f"netprobe-longrun-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}.csv"
-    import csv
-    rows = []
-    last_counters = iface_counters()
-    last_ts = time.time()
-    emit(f"  logging {host} every {interval}s for "
-         f"{minutes * 60:.0f}s -> {path}")
-    end = time.time() + minutes * 60
-    while time.time() < end:
-        if stop is not None and stop.is_set():
-            break
-        ts = time.time()
-        ms = probe_latency(host, None, 3.0)
-        cur = iface_counters()
-        dt = max(0.001, ts - last_ts)
-        rx = sum(max(0.0, cur[n][0] - last_counters.get(n, (0, 0))[0]) for n in cur) / dt
-        tx = sum(max(0.0, cur[n][1] - last_counters.get(n, (0, 0))[1]) for n in cur) / dt
-        last_counters, last_ts = cur, ts
-        rows.append((ts, ms, rx, tx))
-        emit(f"  [{datetime.datetime.fromtimestamp(ts).strftime('%H:%M:%S')}] "
-             f"{'timeout' if ms is None else f'{ms:7.2f} ms'} | "
-             f"rx {fmt_rate(rx).strip()} | tx {fmt_rate(tx).strip()}")
-        time.sleep(max(0.5, interval))
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(("timestamp", "latency_ms", "rx_Bps", "tx_Bps"))
-        for ts, ms, rx, tx in rows:
-            w.writerow((datetime.datetime.fromtimestamp(ts).isoformat(),
-                        "" if ms is None else f"{ms:.2f}", f"{rx:.0f}", f"{tx:.0f}"))
-    ok = sorted(v for _t, v, _r, _x in rows if v is not None)
-    summary = {"samples": len(rows), "received": len(ok),
-               "loss": 100.0 * (len(rows) - len(ok)) / max(1, len(rows)),
-               "file": path}
-    if ok:
-        summary.update({"min": ok[0], "avg": sum(ok) / len(ok), "max": ok[-1],
-                        "p95": ok[min(len(ok) - 1, int(0.95 * (len(ok) - 1)))]})
-        emit(f"  summary: loss {summary['loss']:.1f}%  min {summary['min']:.2f}  "
-             f"avg {summary['avg']:.2f}  p95 {summary['p95']:.2f}  max {summary['max']:.2f} ms")
-    emit(f"  CSV saved: {path}")
-    return summary
-
-
-def generate_report(emit, host: str, path: str = "") -> str:
-    """Full Markdown diagnostic report — the deliverable you hand to a customer."""
-    path = path or f"netprobe-report-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}.md"
-    L = []
-    L.append(f"# NetProbe diagnostic report — {host}")
-    L.append(f"Generated: {datetime.datetime.now().isoformat(timespec='seconds')}")
-    L.append("")
-    L.append("## System")
-    L.append(f"- host: {platform.node()}  ({platform.system()} {platform.release()})")
-    L.append(f"- public IP: {public_ip()}")
-    gw, iface = default_gateway()
-    L.append(f"- default gateway: {gw or '?'} ({iface or '?'})")
-    L.append("")
-    emit("  collecting DNS records…")
-    L.append("## DNS records")
-    L.append("| type | name | value | ttl |")
-    L.append("|---|---|---|---|")
-    for t, n2, v, ttl in dns_records(host):
-        L.append(f"| {t} | {n2} | {str(v)[:70]} | {ttl} |")
-    L.append("")
-    emit("  measuring latency…")
-    vals = [probe_latency(host) for _ in range(20)]
-    ok = sorted(v for v in vals if v is not None)
-    L.append("## Latency")
-    if ok:
-        L.append(f"- samples: {len(ok)}/{len(vals)}, loss "
-                 f"{100.0 * (len(vals) - len(ok)) / len(vals):.1f}%")
-        L.append(f"- min {ok[0]:.2f} / avg {sum(ok) / len(ok):.2f} / "
-                 f"max {ok[-1]:.2f} ms")
-    else:
-        L.append("- all probes failed")
-    L.append("")
-    emit("  HTTP/TLS inspection…")
-    url = host if re.match(r"^https?://", host, re.I) else f"https://{host}"
-    h = http_probe(url)
-    L.append("## HTTP / TLS")
-    if h.get("error"):
-        L.append(f"- {h['error']}")
-    else:
-        L.append(f"- {url}: status {h.get('status')}  total {h.get('total_ms', 0):.1f} ms  "
-                 f"(dns {h.get('dns_ms', 0):.1f} / tcp {h.get('tcp_ms', 0):.1f} / "
-                 f"tls {(h.get('tls_ms') or 0):.1f} / ttfb {h.get('ttfb_ms', 0):.1f})")
-        L.append(f"- server: {h.get('server', '-')}")
-    t = tls_inspect(host)
-    if t.get("error"):
-        L.append(f"- TLS: {t['error']}")
-    else:
-        L.append(f"- TLS {t.get('protocol')} / {t.get('cipher')}  verified={t.get('verified')}")
-        L.append(f"- cert subject: {t.get('subject', {}).get('commonName', '-')}  "
-                 f"issuer: {t.get('issuer', {}).get('organizationName', t.get('issuer', {}).get('commonName', '-'))}")
-        L.append(f"- valid: {t.get('not_before')} → {t.get('not_after')}  "
-                 f"({t.get('days_left', '?')} days left)")
-    L.append("")
-    emit("  collecting local network state…")
-    L.append("## Local network")
-    if HAVE_PSUTIL:
-        try:
-            L.append("| iface | up | speed Mb/s | mtu | ipv4 |")
-            L.append("|---|---|---|---|---|")
-            stats = psutil.net_if_stats()
-            addrs = psutil.net_if_addrs()
-            for name, s in stats.items():
-                ips = [a.address for a in addrs.get(name, []) if a.family == socket.AF_INET]
-                L.append(f"| {name} | {'yes' if s.isup else 'no'} | {s.speed} | {s.mtu} | "
-                         f"{', '.join(ips) or '-'} |")
-        except Exception:
-            pass
-    states = {}
-    if HAVE_PSUTIL:
-        try:
-            for c in psutil.net_connections(kind="inet"):
-                states[c.status] = states.get(c.status, 0) + 1
-        except Exception:
-            pass
-    if states:
-        L.append("")
-        L.append("### Socket states")
-        L.append(", ".join(f"{k}: {v}" for k, v in sorted(states.items(), key=lambda kv: -kv[1])))
-    L.append("")
-    L.append("## Verdict hints")
-    if ok:
-        p95 = ok[min(len(ok) - 1, int(0.95 * (len(ok) - 1)))]
-        L.append(f"- latency p95 {p95:.1f} ms; "
-                 + ("within normal range" if p95 < 120 else "high — investigate path/last-mile"))
-    L.append(f"- TLS certificate days left: {t.get('days_left', 'n/a')}")
-    L.append(f"- default gateway reachable: {'yes' if gw and probe_latency(gw) else 'no/unknown'}")
-    L.append("")
-    L.append("_Generated by NetProbe — diagnostics only._")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(L) + "\n")
-    emit(f"  report saved: {path}")
-    return path
-
-
-# ----------------------------------------------------------------------------
 # Cross-platform command builders
 # ----------------------------------------------------------------------------
-
-# ----------------------------------------------------------------------------
-# Protocol tests: HTTP / HTTPS / FTP / SFTP / WebSocket / DNS / mDNS / LLMNR /
-# DHCP / NTP / ARP / NDP / SMB / NFS / SSDP / SMTP / IMAP / POP3 / SSH /
-# Telnet / RDP / SNMP / Syslog / ICMP / BGP / OSPF / EIGRP
-# ----------------------------------------------------------------------------
-
-def _sp_kwargs():
-    """Safe subprocess kwargs for Windows no-window execution."""
-    return {k: v for k, v in popen_kwargs().items() if k == "creationflags"}
-
-
-def _short_text(value, limit=180):
-    s = str(value).replace("\r", " ").replace("\n", " | ")
-    return s if len(s) <= limit else s[:limit] + "…"
-
-
-def _tcp_connect(host, port, timeout=5.0):
-    """Resolve + TCP connect, returning (socket, ip, dns_ms, tcp_ms)."""
-    addrs, dns_ms = dns_resolve(host)
-    ip = addrs[0]
-    t0 = time.perf_counter()
-    s = socket.create_connection((ip, port), timeout)
-    ms = (time.perf_counter() - t0) * 1000.0
-    return s, ip, dns_ms, ms
-
-
-def _read_smtp_reply(f, timeout=5.0):
-    """Read SMTP/FTP style reply, including multiline replies."""
-    line = f.readline().decode("utf-8", "replace").strip()
-    if not line:
-        return ""
-    lines = [line]
-    if len(line) >= 4 and line[3] == "-":
-        code = line[:3]
-        while True:
-            nxt = f.readline().decode("utf-8", "replace").strip()
-            if not nxt:
-                break
-            lines.append(nxt)
-            if nxt.startswith(code + " "):
-                break
-    return "\n".join(lines)
-
-
-def _read_until_prefix(f, prefix, timeout=5.0, max_lines=25):
-    lines = []
-    for _ in range(max_lines):
-        line = f.readline().decode("utf-8", "replace").strip()
-        if not line:
-            break
-        lines.append(line)
-        if line.startswith(prefix):
-            break
-    return "\n".join(lines)
-
-
-def _wrap_ssl(sock, host, timeout=5.0):
-    """Wrap socket in TLS. Falls back to unverified context for diagnostics."""
-    ctx = ssl.create_default_context()
-    try:
-        return ctx.wrap_socket(sock, server_hostname=host), True, ""
-    except ssl.SSLCertVerificationError as e:
-        try:
-            return ssl._create_unverified_context().wrap_socket(sock, server_hostname=host), False, str(e)
-        except Exception as e2:
-            raise e2
-
-
-def test_http_protocol(host, port=None, timeout=8.0, tls=False, stop=None):
-    proto = "HTTPS" if tls else "HTTP"
-    out = {"protocol": proto, "host": host, "port": port}
-    try:
-        if re.match(r"^https?://", host or "", re.I):
-            url = host
-        else:
-            h = host or "example.com"
-            if tls:
-                port = int(port or 443)
-                url = f"https://{h}/" if port == 443 else f"https://{h}:{port}/"
-            else:
-                port = int(port or 80)
-                url = f"http://{h}/" if port == 80 else f"http://{h}:{port}/"
-
-        r = http_probe(url, timeout=timeout)
-        out.update(r)
-        out["ok"] = bool(r.get("status")) and not r.get("error")
-        out["summary"] = f"status={r.get('status','-')} total={r.get('total_ms', 0) or 0:.1f} ms"
-    except Exception as e:
-        out["ok"] = False
-        out["error"] = str(e)
-    return out
-
-
-def test_websocket(host, port=None, timeout=6.0, stop=None):
-    out = {"protocol": "WebSocket", "target": host}
-    try:
-        if re.match(r"^wss?://", host or "", re.I):
-            u = urlparse(host)
-            tls = (u.scheme == "wss")
-            h = u.hostname or ""
-            port = u.port or (443 if tls else 80)
-            path = u.path or "/"
-            if u.query:
-                path += "?" + u.query
-        else:
-            h = host or "example.com"
-            tls = (port == 443)
-            port = int(port or (443 if tls else 80))
-            path = "/"
-
-        key = base64.b64encode(os.urandom(16)).decode()
-        host_hdr = h if port in (80, 443) else f"{h}:{port}"
-        req = (
-            f"GET {path} HTTP/1.1\r\n"
-            f"Host: {host_hdr}\r\n"
-            f"Upgrade: websocket\r\n"
-            f"Connection: Upgrade\r\n"
-            f"Sec-WebSocket-Key: {key}\r\n"
-            f"Sec-WebSocket-Version: 13\r\n"
-            f"\r\n"
-        )
-
-        addrs, dns_ms = dns_resolve(h)
-        ip = addrs[0]
-        out.update({"host": h, "port": port, "ip": ip, "dns_ms": dns_ms})
-
-        t0 = time.perf_counter()
-        sock = socket.create_connection((ip, port), timeout)
-        out["tcp_ms"] = (time.perf_counter() - t0) * 1000.0
-
-        verified = True
-        if tls:
-            sock, verified, verr = _wrap_ssl(sock, h, timeout)
-            out["tls_verified"] = verified
-            if verr:
-                out["tls_verify_error"] = verr
-
-        sock.settimeout(timeout)
-        sock.sendall(req.encode("latin-1"))
-
-        buf = b""
-        while b"\r\n\r\n" not in buf and len(buf) < 16384:
-            chunk = sock.recv(4096)
-            if not chunk:
-                break
-            buf += chunk
-
-        head = buf.split(b"\r\n\r\n", 1)[0].decode("latin-1", "replace")
-        status = None
-        m = re.match(r"HTTP/\S+\s+(\d+)", head)
-        if m:
-            status = int(m.group(1))
-
-        expected = base64.b64encode(
-            hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()
-        ).decode()
-        accept_ok = expected.lower() in head.lower()
-
-        out.update({
-            "status": status,
-            "sec_websocket_accept_ok": accept_ok,
-            "response_headers": head[:500],
-        })
-        out["ok"] = (status == 101 and accept_ok)
-        out["summary"] = f"HTTP status {status}" + ("" if out["ok"] else " (expected 101)")
-        sock.close()
-    except Exception as e:
-        out["ok"] = False
-        out["error"] = str(e)
-    return out
-
-
-def test_ftp(host, port=21, timeout=6.0, stop=None):
-    out = {"protocol": "FTP", "host": host, "port": port}
-    try:
-        s, ip, dns_ms, tcp_ms = _tcp_connect(host, port, timeout)
-        out.update({"ip": ip, "dns_ms": dns_ms, "tcp_ms": tcp_ms})
-        s.settimeout(timeout)
-        f = s.makefile("rb")
-
-        banner = _read_smtp_reply(f, timeout)
-        out["banner"] = banner
-        ok = banner.startswith("220")
-
-        if ok:
-            s.sendall(b"USER anonymous\r\n")
-            user = _read_smtp_reply(f, timeout)
-            out["user"] = user
-
-            if user.startswith("331"):
-                s.sendall(b"PASS netprobe@example.com\r\n")
-                pw = _read_smtp_reply(f, timeout)
-                out["pass"] = pw
-                ok = bool(pw) and pw[0].isdigit()
-
-            s.sendall(b"QUIT\r\n")
-            try:
-                _read_smtp_reply(f, timeout)
-            except Exception:
-                pass
-
-        out["ok"] = ok
-        out["summary"] = banner.splitlines()[0] if banner else "no banner"
-        s.close()
-    except Exception as e:
-        out["ok"] = False
-        out["error"] = str(e)
-    return out
-
-
-def test_sftp(host, port=22, timeout=6.0, stop=None):
-    out = {"protocol": "SFTP", "host": host, "port": port}
-    try:
-        s, ip, dns_ms, tcp_ms = _tcp_connect(host, port, timeout)
-        out.update({"ip": ip, "dns_ms": dns_ms, "tcp_ms": tcp_ms})
-        s.settimeout(timeout)
-        f = s.makefile("rb")
-
-        banner = f.readline().decode("utf-8", "replace").strip()
-        out["ssh_banner"] = banner
-        ok = banner.startswith("SSH-")
-
-        if ok:
-            s.sendall(b"SSH-2.0-NetProbe\r\n")
-
-        out["ok"] = ok
-        out["summary"] = (
-            "SSH banner detected; full SFTP subsystem test requires credentials/paramiko"
-            if ok else "No SSH banner"
-        )
-        s.close()
-    except Exception as e:
-        out["ok"] = False
-        out["error"] = str(e)
-    return out
-
-
-def test_dns_protocol(host, port=53, timeout=4.0, stop=None):
-    out = {"protocol": "DNS", "target": host, "server_port": port}
-    try:
-        name = host or "example.com"
-        server = "1.1.1.1"
-
-        # Allow target format: example.com@8.8.8.8
-        if "@" in name:
-            name, server = name.rsplit("@", 1)
-
-        ms, pkt = dns_query(server, name, qtype=1, timeout=timeout)
-        rc = pkt.get("rcode")
-        answers = [a[3] for a in pkt.get("answers", []) if a[1] in (1, 28)]
-
-        out.update({
-            "server": server,
-            "name": name,
-            "ms": ms,
-            "rcode": rc,
-            "answers": answers[:6],
-        })
-        out["ok"] = (rc == 0)
-        out["summary"] = f"{len(answers)} answer(s) in {ms:.1f} ms"
-    except Exception as e:
-        out["ok"] = False
-        out["error"] = str(e)
-    return out
-
-
-def test_mdns_protocol(host=None, port=None, timeout=5.0, stop=None):
-    out = {"protocol": "mDNS"}
-    sock = None
-    seen = {}
-    try:
-        sock = _mdns_socket()
-        sock.settimeout(0.5)
-        end = time.time() + timeout
-        sent = False
-
-        while time.time() < end:
-            if stop is not None and stop.is_set():
-                break
-
-            if not sent:
-                sock.sendto(
-                    build_dns_query([(s, 12) for s in MDNS_SERVICES]),
-                    (MDNS_ADDR, MDNS_PORT)
-                )
-                sent = True
-
-            try:
-                data, addr = sock.recvfrom(9000)
-            except socket.timeout:
-                continue
-            except Exception:
-                break
-
-            pkt = parse_dns_message(data)
-            for name, rtype, ttl, val in pkt.get("answers", []):
-                key = (name, rtype, val)
-                seen[key] = addr[0]
-
-        out["ok"] = bool(seen)
-        out["answers"] = len(seen)
-        out["sample"] = [
-            f"{ip} {name} -> {val}"
-            for (name, rtype, val), ip in list(seen.items())[:8]
-        ]
-        out["summary"] = f"{len(seen)} mDNS answer(s)"
-    except Exception as e:
-        out["ok"] = False
-        out["error"] = str(e)
-    finally:
-        if sock:
-            sock.close()
-    return out
-
-
-def test_llmnr_protocol(host="wpad", port=5355, timeout=5.0, stop=None):
-    out = {"protocol": "LLMNR", "query": host or "wpad"}
-    sock = None
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        if hasattr(socket, "SO_REUSEPORT"):
-            try:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-            except Exception:
-                pass
-
-        try:
-            sock.bind(("", 5355))
-        except Exception:
-            sock.bind(("", 0))
-
-        try:
-            mreq = socket.inet_aton("224.0.0.252") + socket.inet_aton("0.0.0.0")
-            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-        except Exception:
-            pass
-
-        sock.settimeout(0.5)
-        msg = build_dns_query([(host or "wpad", 1)], tid=random.randint(0, 65535))
-        sock.sendto(msg, ("224.0.0.252", 5355))
-
-        end = time.time() + timeout
-        answers = []
-
-        while time.time() < end:
-            if stop is not None and stop.is_set():
-                break
-            try:
-                data, addr = sock.recvfrom(9000)
-            except socket.timeout:
-                continue
-            except Exception:
-                break
-
-            pkt = parse_dns_message(data)
-            for name, rtype, ttl, val in pkt.get("answers", []):
-                if rtype in (1, 28):
-                    answers.append((addr[0], name, val))
-
-        out["ok"] = bool(answers)
-        out["answers"] = answers[:8]
-        out["summary"] = f"{len(answers)} LLMNR answer(s)"
-    except Exception as e:
-        out["ok"] = False
-        out["error"] = str(e)
-    finally:
-        if sock:
-            sock.close()
-    return out
-
-
-def test_dhcp_protocol(host=None, port=None, timeout=7.0, stop=None):
-    out = {"protocol": "DHCP"}
-    sock = None
-    try:
-        xid = random.randint(0, 0xFFFFFFFF)
-        mac = uuid.getnode().to_bytes(6, "big")
-
-        bootp = struct.pack(
-            "!BBBBIHH4s4s4s4s16s64s128s",
-            1, 1, 6, 0, xid, 0, 0x8000,
-            b"\0" * 4, b"\0" * 4, b"\0" * 4, b"\0" * 4,
-            mac.ljust(16, b"\0"), b"\0" * 64, b"\0" * 128
-        )
-
-        opts = b"\x63\x82\x53\x63"
-        opts += bytes([53, 1, 1])          # DHCPDISCOVER
-        opts += bytes([61, 7, 1]) + mac    # Client identifier
-        opts += bytes([12, 8]) + b"netprobe"
-        opts += bytes([55, 4, 1, 3, 6, 15])  # subnet, router, dns, domain
-        opts += bytes([255])
-
-        pkt = bootp + opts
-
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-
-        try:
-            sock.bind(("", 68))
-            out["bind"] = "0.0.0.0:68"
-        except Exception as e:
-            out["bind_error"] = str(e)
-            sock.bind(("", 0))
-            out["note"] = "Could not bind UDP/68; DHCP replies usually require root/admin."
-
-        sock.settimeout(timeout)
-        sock.sendto(pkt, ("255.255.255.255", 67))
-
-        end = time.time() + timeout
-        offers = []
-
-        while time.time() < end:
-            if stop is not None and stop.is_set():
-                break
-            try:
-                data, addr = sock.recvfrom(4096)
-            except socket.timeout:
-                break
-
-            if len(data) >= 240:
-                yiaddr = socket.inet_ntoa(data[16:20])
-                offers.append({
-                    "server": addr[0],
-                    "offered_ip": yiaddr if yiaddr != "0.0.0.0" else "-",
-                })
-
-        out["ok"] = bool(offers)
-        out["offers"] = offers
-        out["summary"] = f"{len(offers)} DHCP offer(s)" if offers else "No DHCP offer received"
-    except Exception as e:
-        out["ok"] = False
-        out["error"] = str(e)
-    finally:
-        if sock:
-            sock.close()
-    return out
-
-
-def test_ntp_protocol(host, port=123, timeout=4.0, stop=None):
-    out = {"protocol": "NTP", "host": host, "port": port}
-    s = None
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.settimeout(timeout)
-
-        req = b"\x1b" + b"\0" * 47
-        t0 = time.perf_counter()
-        s.sendto(req, (host, port))
-        data, _ = s.recvfrom(1024)
-        rtt = (time.perf_counter() - t0) * 1000.0
-        out["rtt_ms"] = rtt
-
-        if len(data) >= 48:
-            stratum = data[1]
-            tx = struct.unpack("!I", data[40:44])[0]
-            if tx:
-                unix = tx - 2208988800
-                out["time"] = datetime.datetime.fromtimestamp(unix).isoformat()
-            out["stratum"] = stratum
-            out["ok"] = True
-            out["summary"] = f"NTP response received, stratum {stratum}"
-        else:
-            out["ok"] = False
-            out["error"] = "short response"
-    except Exception as e:
-        out["ok"] = False
-        out["error"] = str(e)
-    finally:
-        if s:
-            s.close()
-    return out
-
-
-def test_arp_protocol(host=None, port=None, timeout=5.0, stop=None):
-    out = {"protocol": "ARP"}
-    target = host if host and re.match(r"^\d+\.\d+\.\d+\.\d+$", host) else None
-
-    if target:
-        arping = shutil_which("arping")
-        if arping:
-            cmd = [arping, "-c", "1", "-w", str(max(1, int(timeout))), target]
-            try:
-                r = subprocess.run(cmd, capture_output=True, text=True,
-                                   timeout=timeout + 5, **_sp_kwargs())
-                out["arping"] = _short_text(r.stdout or r.stderr, 220)
-            except Exception as e:
-                out["arping_error"] = str(e)
-        else:
-            try:
-                icmp_ping_once(target, timeout=2.0)
-            except Exception:
-                pass
-
-    entries = arp_entries()
-    out["entries"] = len(entries)
-    out["sample"] = [f"{ip} {mac} {ifc}" for ip, (mac, ifc) in list(entries.items())[:10]]
-
-    if target:
-        out["ok"] = target in entries
-        out["summary"] = f"target {target} " + ("found in ARP cache" if out["ok"] else "not in ARP cache")
-    else:
-        out["ok"] = len(entries) > 0
-        out["summary"] = f"{len(entries)} ARP cache entries"
-
-    return out
-
-
-def test_ndp_protocol(host=None, port=None, timeout=8.0, stop=None):
-    out = {"protocol": "NDP"}
-    try:
-        if IS_WIN:
-            cmd = ["netsh", "interface", "ipv6", "show", "neighbors"]
-        elif IS_MAC:
-            cmd = ["ndp", "-an"]
-        else:
-            cmd = ["ip", "-6", "neigh", "show"]
-
-        r = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=timeout + 8, **_sp_kwargs())
-        txt = r.stdout or ""
-
-        ipv6s = re.findall(r"(?i)[0-9a-f]{1,4}(?::[0-9a-f]{1,4}){2,7}", txt)
-        entries = sorted(set(ipv6s))
-
-        out["entries"] = len(entries)
-        out["sample"] = entries[:12]
-        out["ok"] = len(entries) > 0
-        out["summary"] = f"{len(entries)} IPv6 neighbour entry(ies)"
-    except Exception as e:
-        out["ok"] = False
-        out["error"] = str(e)
-    return out
-
-
-def test_smb_protocol(host, port=445, timeout=5.0, stop=None):
-    out = {"protocol": "SMB", "host": host, "port": port}
-    try:
-        s, ip, dns_ms, tcp_ms = _tcp_connect(host, port, timeout)
-        out.update({"ip": ip, "dns_ms": dns_ms, "tcp_ms": tcp_ms})
-        s.settimeout(timeout)
-
-        guid = os.urandom(16)
-
-        # Minimal SMB2 negotiate request.
-        header = b"\xfeSMB" + struct.pack(
-            "<HHIHHIIQIIQ16s",
-            64, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, b"\0" * 16
-        )
-        negotiate = struct.pack(
-            "<HHHHI16sQ",
-            36, 2, 1, 0, 0, guid, 0
-        ) + struct.pack("<HH", 0x0202, 0x0210)
-
-        payload = header + negotiate
-        pkt = b"\x00" + len(payload).to_bytes(3, "big") + payload
-        s.sendall(pkt)
-
-        try:
-            resp = s.recv(4096)
-            out["response_bytes"] = len(resp)
-            if len(resp) > 4 and resp[4:8] == b"\xfeSMB":
-                out["smb_response"] = "SMB2 response seen"
-                out["ok"] = True
-                out["summary"] = "SMB port open and SMB2 response seen"
-            else:
-                out["ok"] = True
-                out["note"] = "TCP open, but no SMB2 response parsed"
-                out["summary"] = "SMB port open"
-        except socket.timeout:
-            out["ok"] = True
-            out["note"] = "TCP open, no SMB2 response within timeout"
-            out["summary"] = "SMB port open"
-
-        s.close()
-    except Exception as e:
-        out["ok"] = False
-        out["error"] = str(e)
-    return out
-
-
-def test_nfs_protocol(host, port=2049, timeout=5.0, stop=None):
-    out = {"protocol": "NFS", "host": host}
-    ports = {int(port or 2049), 2049, 111}
-    open_ports = []
-
-    for p in sorted(ports):
-        try:
-            s, ip, dns_ms, ms = _tcp_connect(host, p, timeout=3.0)
-            s.close()
-            open_ports.append(p)
-        except Exception:
-            pass
-
-    out["open_ports"] = open_ports
-    out["ok"] = bool(open_ports)
-
-    showmount = shutil_which("showmount")
-    if showmount:
-        try:
-            r = subprocess.run([showmount, "-e", host], capture_output=True, text=True,
-                               timeout=timeout + 8, **_sp_kwargs())
-            out["showmount"] = _short_text(r.stdout or r.stderr, 300)
-            if "Export list" in (r.stdout or ""):
-                out["ok"] = True
-        except Exception as e:
-            out["showmount_error"] = str(e)
-
-    out["summary"] = f"open NFS-related ports: {open_ports or 'none'}"
-    return out
-
-
-def test_ssdp_protocol(host=None, port=None, timeout=5.0, stop=None):
-    out = {"protocol": "SSDP"}
-    sock = None
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
-        except Exception:
-            pass
-        sock.settimeout(0.5)
-
-        msg = (
-            "M-SEARCH * HTTP/1.1\r\n"
-            "HOST: 239.255.255.250:1900\r\n"
-            "MAN: \"ssdp:discover\"\r\n"
-            "MX: 2\r\n"
-            "ST: ssdp:all\r\n"
-            "\r\n"
-        ).encode()
-
-        sock.sendto(msg, ("239.255.255.250", 1900))
-        end = time.time() + timeout
-        devices = {}
-
-        while time.time() < end:
-            if stop is not None and stop.is_set():
-                break
-            try:
-                data, addr = sock.recvfrom(4096)
-            except socket.timeout:
-                continue
-            except Exception:
-                break
-
-            txt = data.decode("utf-8", "replace")
-            first = txt.splitlines()[0] if txt else ""
-            loc = re.search(r"LOCATION:\s*(\S+)", txt, re.I)
-            srv = re.search(r"SERVER:\s*(.+)", txt, re.I)
-
-            devices[addr[0]] = {
-                "first": first,
-                "location": loc.group(1) if loc else "",
-                "server": srv.group(1).strip() if srv else "",
-            }
-
-        out["ok"] = bool(devices)
-        out["devices"] = len(devices)
-        out["sample"] = [
-            f"{ip}: {d.get('server','')} {d.get('location','')}"
-            for ip, d in list(devices.items())[:8]
-        ]
-        out["summary"] = f"{len(devices)} SSDP device(s)"
-    except Exception as e:
-        out["ok"] = False
-        out["error"] = str(e)
-    finally:
-        if sock:
-            sock.close()
-    return out
-
-
-def test_smtp_protocol(host, port=25, timeout=6.0, stop=None):
-    out = {"protocol": "SMTP", "host": host, "port": port}
-    try:
-        s, ip, dns_ms, tcp_ms = _tcp_connect(host, port, timeout)
-        out.update({"ip": ip, "dns_ms": dns_ms, "tcp_ms": tcp_ms})
-        s.settimeout(timeout)
-        f = s.makefile("rb")
-
-        banner = _read_smtp_reply(f, timeout)
-        out["banner"] = banner
-        ok = banner.startswith("220")
-
-        if ok:
-            s.sendall(b"EHLO netprobe.local\r\n")
-            ehlo = _read_smtp_reply(f, timeout)
-            out["ehlo"] = ehlo
-            ok = ehlo.startswith("250")
-
-            s.sendall(b"QUIT\r\n")
-            try:
-                out["quit"] = _read_smtp_reply(f, timeout)
-            except Exception:
-                pass
-
-        out["ok"] = ok
-        out["summary"] = banner.splitlines()[0] if banner else "no banner"
-        s.close()
-    except Exception as e:
-        out["ok"] = False
-        out["error"] = str(e)
-    return out
-
-
-def test_imap_protocol(host, port=143, timeout=6.0, stop=None):
-    out = {"protocol": "IMAP", "host": host, "port": port}
-    try:
-        s, ip, dns_ms, tcp_ms = _tcp_connect(host, port, timeout)
-        out.update({"ip": ip, "dns_ms": dns_ms, "tcp_ms": tcp_ms})
-
-        if port == 993:
-            s, verified, verr = _wrap_ssl(s, host, timeout)
-            out["tls_verified"] = verified
-            if verr:
-                out["tls_verify_error"] = verr
-
-        s.settimeout(timeout)
-        f = s.makefile("rb")
-
-        banner = f.readline().decode("utf-8", "replace").strip()
-        out["banner"] = banner
-        ok = banner.startswith("* OK")
-
-        if ok:
-            s.sendall(b"a1 CAPABILITY\r\n")
-            cap = _read_until_prefix(f, "a1 ", timeout)
-            out["capability"] = cap
-            ok = "a1 OK" in cap
-
-            s.sendall(b"a2 LOGOUT\r\n")
-            try:
-                _read_until_prefix(f, "a2 ", timeout)
-            except Exception:
-                pass
-
-        out["ok"] = ok
-        out["summary"] = "IMAP banner OK" if ok else "IMAP unexpected banner"
-        s.close()
-    except Exception as e:
-        out["ok"] = False
-        out["error"] = str(e)
-    return out
-
-
-def test_pop3_protocol(host, port=110, timeout=6.0, stop=None):
-    out = {"protocol": "POP3", "host": host, "port": port}
-    try:
-        s, ip, dns_ms, tcp_ms = _tcp_connect(host, port, timeout)
-        out.update({"ip": ip, "dns_ms": dns_ms, "tcp_ms": tcp_ms})
-
-        if port == 995:
-            s, verified, verr = _wrap_ssl(s, host, timeout)
-            out["tls_verified"] = verified
-            if verr:
-                out["tls_verify_error"] = verr
-
-        s.settimeout(timeout)
-        f = s.makefile("rb")
-
-        banner = f.readline().decode("utf-8", "replace").strip()
-        out["banner"] = banner
-        ok = banner.startswith("+OK")
-
-        if ok:
-            s.sendall(b"CAPA\r\n")
-            capa = []
-            for _ in range(25):
-                line = f.readline().decode("utf-8", "replace").strip()
-                if not line or line == ".":
-                    break
-                capa.append(line)
-            out["capa"] = " | ".join(capa[:10])
-
-            s.sendall(b"QUIT\r\n")
-            try:
-                out["quit"] = f.readline().decode("utf-8", "replace").strip()
-            except Exception:
-                pass
-
-        out["ok"] = ok
-        out["summary"] = banner or "no banner"
-        s.close()
-    except Exception as e:
-        out["ok"] = False
-        out["error"] = str(e)
-    return out
-
-
-def test_ssh_protocol(host, port=22, timeout=6.0, stop=None):
-    out = {"protocol": "SSH", "host": host, "port": port}
-    try:
-        s, ip, dns_ms, tcp_ms = _tcp_connect(host, port, timeout)
-        out.update({"ip": ip, "dns_ms": dns_ms, "tcp_ms": tcp_ms})
-        s.settimeout(timeout)
-        f = s.makefile("rb")
-
-        banner = f.readline().decode("utf-8", "replace").strip()
-        out["banner"] = banner
-        ok = banner.startswith("SSH-")
-
-        if ok:
-            s.sendall(b"SSH-2.0-NetProbe\r\n")
-
-        out["ok"] = ok
-        out["summary"] = "SSH banner detected" if ok else "No SSH banner"
-        s.close()
-    except Exception as e:
-        out["ok"] = False
-        out["error"] = str(e)
-    return out
-
-
-def test_telnet_protocol(host, port=23, timeout=5.0, stop=None):
-    out = {"protocol": "Telnet", "host": host, "port": port}
-    try:
-        s, ip, dns_ms, tcp_ms = _tcp_connect(host, port, timeout)
-        out.update({"ip": ip, "dns_ms": dns_ms, "tcp_ms": tcp_ms})
-        s.settimeout(timeout)
-
-        data = b""
-        try:
-            data = s.recv(1024)
-        except socket.timeout:
-            pass
-
-        out["banner_hex"] = data[:80].hex()
-
-        try:
-            s.sendall(b"\r\n")
-            data2 = s.recv(1024)
-            out["post_crlf_hex"] = data2[:80].hex()
-        except Exception:
-            pass
-
-        out["ok"] = True
-        out["summary"] = "TCP open; Telnet may require interactive negotiation"
-        s.close()
-    except Exception as e:
-        out["ok"] = False
-        out["error"] = str(e)
-    return out
-
-
-def test_rdp_protocol(host, port=3389, timeout=5.0, stop=None):
-    out = {"protocol": "RDP", "host": host, "port": port}
-    try:
-        s, ip, dns_ms, tcp_ms = _tcp_connect(host, port, timeout)
-        out.update({"ip": ip, "dns_ms": dns_ms, "tcp_ms": tcp_ms, "tcp_open": True})
-        s.settimeout(timeout)
-
-        # Minimal X.224/RDP negotiation request.
-        req = bytes.fromhex("030000130ee000000000000100080003000000")
-        s.sendall(req)
-
-        try:
-            resp = s.recv(1024)
-        except socket.timeout:
-            resp = b""
-
-        out["response_bytes"] = len(resp)
-
-        if resp.startswith(b"\x03\x00"):
-            out["ok"] = True
-            out["summary"] = "RDP TPKT response seen"
-        else:
-            out["ok"] = False
-            out["summary"] = "TCP open, but no RDP TPKT response"
-
-        s.close()
-    except Exception as e:
-        out["ok"] = False
-        out["error"] = str(e)
-    return out
-
-
-def test_snmp_protocol(host, port=161, timeout=4.0, stop=None):
-    out = {"protocol": "SNMP", "host": host, "port": port, "community": "public"}
-    s = None
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.settimeout(timeout)
-
-        # SNMPv2c GET sysDescr.0 with community public.
-        pkt = bytes.fromhex(
-            "302902010104067075626c6963a01c020401020304020100020100300e300c"
-            "06082b060102010101000500"
-        )
-
-        s.sendto(pkt, (host, port))
-        data, _ = s.recvfrom(4096)
-
-        out["response_bytes"] = len(data)
-        out["ok"] = len(data) > 0 and data[0] == 0x30
-        out["summary"] = "SNMP response received" if out["ok"] else "response not parseable"
-    except Exception as e:
-        out["ok"] = False
-        out["error"] = str(e)
-    finally:
-        if s:
-            s.close()
-    return out
-
-
-def test_syslog_protocol(host, port=514, timeout=4.0, stop=None):
-    out = {"protocol": "Syslog", "host": host, "port": port}
-    try:
-        msg = (
-            f"<{19 * 8 + 6}>"
-            f"{datetime.datetime.now().strftime('%b %d %H:%M:%S')} "
-            f"netprobe: protocol test"
-        ).encode()
-
-        if port == 6514:
-            s, ip, dns_ms, tcp_ms = _tcp_connect(host, port, timeout)
-            out.update({"ip": ip, "dns_ms": dns_ms, "tcp_ms": tcp_ms, "transport": "TCP"})
-            s.sendall(msg + b"\n")
-            s.close()
-        else:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.settimeout(timeout)
-            s.sendto(msg, (host, port))
-            s.close()
-            out["transport"] = "UDP"
-
-        out["ok"] = True
-        out["summary"] = "message sent; UDP syslog has no delivery acknowledgement"
-    except Exception as e:
-        out["ok"] = False
-        out["error"] = str(e)
-    return out
-
-
-def test_icmp_protocol(host, port=None, timeout=12.0, stop=None):
-    out = {"protocol": "ICMP", "host": host}
-    vals = []
-
-    for _ in range(3):
-        if stop is not None and stop.is_set():
-            break
-        ms = icmp_ping_once(host, timeout=3.0)
-        vals.append(ms)
-        time.sleep(0.2)
-
-    ok = [v for v in vals if v is not None]
-    out["samples"] = vals
-    out["ok"] = bool(ok)
-    out["summary"] = f"{len(ok)}/{len(vals)} replies"
-    if ok:
-        out["summary"] += f", avg {sum(ok) / len(ok):.1f} ms"
-
-    return out
-
-
-def test_bgp_protocol(host, port=179, timeout=6.0, stop=None):
-    out = {"protocol": "BGP", "host": host, "port": port}
-    try:
-        s, ip, dns_ms, tcp_ms = _tcp_connect(host, port, timeout)
-        out.update({"ip": ip, "dns_ms": dns_ms, "tcp_ms": tcp_ms})
-        s.settimeout(timeout)
-
-        asn = 65001
-        open_body = struct.pack(
-            "!BHH4sB",
-            4, asn, 90, socket.inet_aton("192.0.2.1"), 0
-        )
-        msg = b"\xff" * 16 + struct.pack("!HB", 29, 1) + open_body
-        s.sendall(msg)
-
-        try:
-            resp = s.recv(4096)
-        except socket.timeout:
-            resp = b""
-
-        out["response_bytes"] = len(resp)
-
-        if len(resp) >= 19 and resp[:16] == b"\xff" * 16:
-            mtype = resp[18]
-            out["bgp_message_type"] = {
-                1: "OPEN",
-                2: "UPDATE",
-                3: "NOTIFICATION",
-                4: "KEEPALIVE",
-            }.get(mtype, mtype)
-
-            if mtype == 3 and len(resp) >= 21:
-                out["notification_code"] = resp[19]
-                out["notification_subcode"] = resp[20]
-
-            out["ok"] = True
-            out["summary"] = f"BGP reachable, received {out['bgp_message_type']}"
-        else:
-            out["ok"] = False
-            out["summary"] = "TCP open, but no BGP message received"
-
-        s.close()
-    except Exception as e:
-        out["ok"] = False
-        out["error"] = str(e)
-    return out
-
-
-def _raw_protocol_listen(proto, multicast, timeout, out):
-    sock = None
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, proto)
-        sock.settimeout(timeout)
-
-        try:
-            if multicast:
-                mreq = socket.inet_aton(multicast) + socket.inet_aton("0.0.0.0")
-                sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-        except Exception:
-            pass
-
-        try:
-            sock.bind(("", 0))
-        except Exception:
-            pass
-
-        data = sock.recv(65535)
-        out["ok"] = len(data) > 0
-        out["bytes"] = len(data)
-        out["summary"] = (
-            f"raw packet received ({len(data)} bytes); root/CAP_NET_RAW and local traffic required"
-        )
-    except PermissionError as e:
-        out["ok"] = False
-        out["error"] = f"raw socket permission denied: {e}"
-        out["summary"] = "Run as root/administrator to test raw routing protocols."
-    except socket.timeout:
-        out["ok"] = False
-        out["error"] = "timeout waiting for raw packet"
-        out["summary"] = "No local packets observed. Routing protocol must be present on this segment."
-    except Exception as e:
-        out["ok"] = False
-        out["error"] = str(e)
-    finally:
-        if sock:
-            sock.close()
-
-    return out
-
-
-def test_ospf_protocol(host=None, port=None, timeout=5.0, stop=None):
-    out = {"protocol": "OSPF"}
-    return _raw_protocol_listen(89, "224.0.0.5", timeout, out)
-
-
-def test_eigrp_protocol(host=None, port=None, timeout=5.0, stop=None):
-    out = {"protocol": "EIGRP"}
-    return _raw_protocol_listen(88, "224.0.0.10", timeout, out)
-
-
-PROTOCOL_TESTS = {
-    "HTTP": {
-        "fn": lambda h, p, stop: test_http_protocol(h, p or 80, tls=False, stop=stop),
-        "port": 80,
-        "note": "HTTP GET timing/status.",
-    },
-    "HTTPS": {
-        "fn": lambda h, p, stop: test_http_protocol(h, p or 443, tls=True, stop=stop),
-        "port": 443,
-        "note": "HTTPS GET timing/status/TLS.",
-    },
-    "FTP": {
-        "fn": lambda h, p, stop: test_ftp(h, p or 21, stop=stop),
-        "port": 21,
-        "note": "FTP banner + anonymous login attempt.",
-    },
-    "SFTP": {
-        "fn": lambda h, p, stop: test_sftp(h, p or 22, stop=stop),
-        "port": 22,
-        "note": "SSH banner check; full SFTP needs credentials/paramiko.",
-    },
-    "WebSockets": {
-        "fn": lambda h, p, stop: test_websocket(h, p, stop=stop),
-        "port": 80,
-        "note": "Use ws://host/path or wss://host/path; otherwise does Upgrade handshake.",
-    },
-    "DNS": {
-        "fn": lambda h, p, stop: test_dns_protocol(h, p or 53, stop=stop),
-        "port": 53,
-        "note": "Target format: name@resolver, e.g. example.com@8.8.8.8.",
-    },
-    "mDNS": {
-        "fn": lambda h, p, stop: test_mdns_protocol(h, p, stop=stop),
-        "port": 5353,
-        "note": "Multicast DNS discovery/listen.",
-    },
-    "LLMNR": {
-        "fn": lambda h, p, stop: test_llmnr_protocol(h, p or 5355, stop=stop),
-        "port": 5355,
-        "note": "Link-Local Multicast Name Resolution query.",
-    },
-    "DHCP": {
-        "fn": lambda h, p, stop: test_dhcp_protocol(h, p, stop=stop),
-        "port": 67,
-        "note": "DHCPDISCOVER; requires admin/root for reliable replies.",
-    },
-    "NTP": {
-        "fn": lambda h, p, stop: test_ntp_protocol(h, p or 123, stop=stop),
-        "port": 123,
-        "note": "NTP time request.",
-    },
-    "ARP": {
-        "fn": lambda h, p, stop: test_arp_protocol(h, stop=stop),
-        "port": 0,
-        "note": "ARP cache / arping if installed. Target optional IPv4.",
-    },
-    "NDP": {
-        "fn": lambda h, p, stop: test_ndp_protocol(h, stop=stop),
-        "port": 0,
-        "note": "IPv6 neighbour cache.",
-    },
-    "SMB": {
-        "fn": lambda h, p, stop: test_smb_protocol(h, p or 445, stop=stop),
-        "port": 445,
-        "note": "SMB2 negotiation probe.",
-    },
-    "NFS": {
-        "fn": lambda h, p, stop: test_nfs_protocol(h, p or 2049, stop=stop),
-        "port": 2049,
-        "note": "Checks 2049/111 and showmount if available.",
-    },
-    "SSDP": {
-        "fn": lambda h, p, stop: test_ssdp_protocol(h, p, stop=stop),
-        "port": 1900,
-        "note": "UPnP SSDP M-SEARCH.",
-    },
-    "SMTP": {
-        "fn": lambda h, p, stop: test_smtp_protocol(h, p or 25, stop=stop),
-        "port": 25,
-        "note": "SMTP banner/EHLO; use 25/587.",
-    },
-    "IMAP": {
-        "fn": lambda h, p, stop: test_imap_protocol(h, p or 143, stop=stop),
-        "port": 143,
-        "note": "IMAP banner/CAPABILITY; 993 uses TLS.",
-    },
-    "POP3": {
-        "fn": lambda h, p, stop: test_pop3_protocol(h, p or 110, stop=stop),
-        "port": 110,
-        "note": "POP3 banner/CAPA; 995 uses TLS.",
-    },
-    "SSH": {
-        "fn": lambda h, p, stop: test_ssh_protocol(h, p or 22, stop=stop),
-        "port": 22,
-        "note": "SSH banner check.",
-    },
-    "Telnet": {
-        "fn": lambda h, p, stop: test_telnet_protocol(h, p or 23, stop=stop),
-        "port": 23,
-        "note": "Telnet TCP check.",
-    },
-    "RDP": {
-        "fn": lambda h, p, stop: test_rdp_protocol(h, p or 3389, stop=stop),
-        "port": 3389,
-        "note": "RDP negotiation request.",
-    },
-    "SNMP": {
-        "fn": lambda h, p, stop: test_snmp_protocol(h, p or 161, stop=stop),
-        "port": 161,
-        "note": "SNMPv2c GET sysDescr with community public.",
-    },
-    "Syslog": {
-        "fn": lambda h, p, stop: test_syslog_protocol(h, p or 514, stop=stop),
-        "port": 514,
-        "note": "Sends test syslog; UDP has no ACK. 6514 uses TCP.",
-    },
-    "ICMP": {
-        "fn": lambda h, p, stop: test_icmp_protocol(h, stop=stop),
-        "port": 0,
-        "note": "System ping (ICMP echo).",
-    },
-    "BGP": {
-        "fn": lambda h, p, stop: test_bgp_protocol(h, p or 179, stop=stop),
-        "port": 179,
-        "note": "TCP BGP OPEN probe; use only on routers you control.",
-    },
-    "OSPF": {
-        "fn": lambda h, p, stop: test_ospf_protocol(h, p, stop=stop),
-        "port": 0,
-        "note": "Raw socket listener; requires root/admin.",
-    },
-    "EIGRP": {
-        "fn": lambda h, p, stop: test_eigrp_protocol(h, p, stop=stop),
-        "port": 0,
-        "note": "Raw socket listener; requires root/admin.",
-    },
-}
-
 def popen_kwargs() -> dict:
     kw = dict(stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
               text=True, encoding="utf-8", errors="replace", bufsize=1)
@@ -2982,10 +1489,6 @@ def cmd_ping(host: str, count: int = 4) -> list:
 def cmd_trace(host: str) -> list:
     if IS_WIN:
         return ["tracert", "-d", "-h", "30", "-w", "2000", host]
-    if shutil_which("traceroute"):
-        return ["traceroute", "-n", "-m", "30", "-q", "1", host]
-    if shutil_which("tracepath"):
-        return ["tracepath", "-n", "-m", "30", host]   # Linux fallback
     return ["traceroute", "-n", "-m", "30", "-q", "1", host]
 
 
@@ -3062,6 +1565,9 @@ class TerminalView(ttk.Frame):
         self.name = name
         self.proc = None
         self.stop_flag = threading.Event()
+        self._dead = False
+        self._spin_job = None
+        self._status_text = "idle"
 
         self.text = tk.Text(self, wrap="none", bg=C["bg"], fg=C["fg"],
                             insertbackground=C["fg"], font=MONO,
@@ -3088,10 +1594,12 @@ class TerminalView(ttk.Frame):
                                ("Clear", self.clear, C["panel2"]),
                                ("Copy", self._copy, C["panel2"]),
                                ("Save", self.save, C["panel2"])):
-            tk.Button(bar, text=label, command=fn, bg=col,
-                      fg=C["bg"] if col in (C["accent"], C["err"]) else C["fg"],
-                      activebackground=C["border"], activeforeground=C["fg"],
-                      relief="flat", font=UI_FONT, cursor="hand2", padx=8).pack(side="left", padx=2)
+            b = tk.Button(bar, text=label, command=fn, bg=col,
+                          fg=C["bg"] if col in (C["accent"], C["err"]) else C["fg"],
+                          activebackground=C["border"], activeforeground=C["fg"],
+                          relief="flat", font=UI_FONT, cursor="hand2", padx=8)
+            b.pack(side="left", padx=2)
+            attach_hover(b, col, C["bg"] if col in (C["accent"], C["err"]) else C["fg"])
 
         self.rowconfigure(0, weight=1)
         self.columnconfigure(0, weight=1)
@@ -3103,26 +1611,99 @@ class TerminalView(ttk.Frame):
         self.text.tag_configure("info", foreground=C["dim"])
         self.text.tag_configure("title", foreground=C["accent"], font=(MONO[0], MONO[1], "bold"))
         self.text.tag_configure("head", foreground=C["head"])
+        self.text.tag_configure("prog", foreground=C["accent"])
 
         self.text.bind("<Control-c>", self._copy)
         self.text.bind("<Control-a>", self._select_all)
 
     # -- output -------------------------------------------------------------
+    def _alive(self):
+        """False once this pane has been closed — all output then becomes a no-op."""
+        try:
+            return bool(self.winfo_exists())
+        except Exception:
+            return False
+
     def set_status(self, s: str):
-        self.status_var.set(s)
+        self._status_text = s
+        if not self._alive():
+            return
+        if s == "running":
+            if self._spin_job is None:
+                self._spin()
+        else:
+            if self._spin_job is not None:
+                try:
+                    self.after_cancel(self._spin_job)
+                except Exception:
+                    pass
+                self._spin_job = None
+            self.status_var.set(s)
+
+    def _spin(self, i=0):
+        """Animated spinner shown while this pane's command runs."""
+        self._spin_job = None
+        if not self._alive() or self._status_text != "running":
+            return
+        self.status_var.set(f"{SPIN_FRAMES[i % len(SPIN_FRAMES)]} running")
+        self._spin_job = self.after(110, self._spin, i + 1)
+
+    def _drop_trailing_prog(self):
+        """Progress is transient UI — remove the trailing progress line."""
+        try:
+            idx = self.text.index("end-1c linestart")
+            if "prog" in self.text.tag_names(idx):
+                self.text.delete(idx, "end")
+        except Exception:
+            pass
+
+    def set_progress(self, frac: float, label: str = ""):
+        """Animated progress bar line at the bottom of the pane."""
+        if not self._alive():
+            return
+        self._drop_trailing_prog()
+        frac = max(0.0, min(1.0, float(frac)))
+        line = f"  {render_bar(frac)} {int(frac * 100):3d}%  {label}"
+        self.text.insert("end", line + "\n", "prog")
+        self.text.see("end")
+
+    def clear_progress(self):
+        if self._alive():
+            self._drop_trailing_prog()
 
     def write(self, line: str, tag: str = "head"):
+        if not self._alive():
+            return
+        self._drop_trailing_prog()
         self.text.insert("end", line + "\n", tag)
         self.text.see("end")
+
+    def type_text(self, text: str, tag: str = "head", speed: int = 12,
+                  done=None, i: int = 0):
+        """Typewriter reveal used by the animated intro."""
+        if not self._alive():
+            return
+        if i < len(text):
+            self.text.insert("end", text[i], tag)
+            self.text.see("end")
+            self.after(speed, lambda: self.type_text(text, tag, speed, done, i + 1))
+        else:
+            self.text.insert("end", "\n")
+            self.text.see("end")
+            if done:
+                done()
 
     def banner(self, cmd):
         self.write("─" * 78, "info")
         self.write(f"[{now()}] [{self.name}] $ {' '.join(str(c) for c in cmd)}", "cmd")
 
     def clear(self):
-        self.text.delete("1.0", "end")
+        if self._alive():
+            self.text.delete("1.0", "end")
 
     def dump(self) -> str:
+        if not self._alive():
+            return ""
         return self.text.get("1.0", "end")
 
     # -- own command line ---------------------------------------------------
@@ -3145,6 +1726,7 @@ class TerminalView(ttk.Frame):
             except Exception:
                 pass
             self.write("■ stopped by user", "warn")
+        self.clear_progress()
         self.set_status("stopped")
 
     def save(self):
@@ -3185,10 +1767,11 @@ class TerminalsPanel(ttk.Frame):
         for label, fn in (("＋ New Terminal", self.add_terminal),
                           ("✕ Close Terminal", self.close_terminal),
                           ("Run All: Ping", self.ping_all)):
-            tk.Button(top, text=label, command=fn, bg=C["panel2"], fg=C["fg"],
-                      activebackground=C["accent"], activeforeground=C["bg"],
-                      relief="flat", font=UI_FONT, cursor="hand2", padx=10
-                      ).pack(side="left", padx=3)
+            b = tk.Button(top, text=label, command=fn, bg=C["panel2"], fg=C["fg"],
+                          activebackground=C["accent"], activeforeground=C["bg"],
+                          relief="flat", font=UI_FONT, cursor="hand2", padx=10)
+            b.pack(side="left", padx=3)
+            attach_hover(b, C["panel2"], C["fg"])
         tk.Label(top, text="each tab = one independent output stream + command line",
                  bg=C["bg"], fg=C["dim"], font=UI_FONT).pack(side="right", padx=8)
 
@@ -3212,9 +1795,13 @@ class TerminalsPanel(ttk.Frame):
             return
         v = self.active()
         v.stop()
+        v._dead = True
         self.tabs.forget(v)
-        self.views.remove(v)
+        if v in self.views:
+            self.views.remove(v)
         v.destroy()
+        # hand the quick commands a fresh live pane immediately
+        self.after(50, self.active)
 
     def ping_all(self):
         """Fan out one ping per terminal — multi-output comparison."""
@@ -3225,13 +1812,20 @@ class TerminalsPanel(ttk.Frame):
             self.app.run_cmd(cmd_ping(h, 10), pane=v)
 
     def active(self):
+        """The pane quick-command output goes to.  Never returns a dead widget —
+        closing a terminal used to break every quick command afterwards."""
         try:
-            cur = self.tabs.nametowidget(self.tabs.select())
-            if isinstance(cur, TerminalView):
-                return cur
+            sel = self.tabs.select()
+            if sel:
+                cur = self.tabs.nametowidget(sel)
+                if isinstance(cur, TerminalView) and cur._alive():
+                    return cur
         except Exception:
             pass
-        return self.views[0]
+        self.views = [v for v in self.views if v._alive()]
+        for v in self.views:
+            return v
+        return self.add_terminal("Term 1")
 
     def all_views(self):
         return list(self.views)
@@ -3248,6 +1842,7 @@ class TrafficPanel(ttk.Frame):
         self.totals = {}       # iface -> (rx_total, tx_total) baseline
         self.last = {}         # iface -> (ts, rx, tx) counters
         self.paused = False
+        self._pulse = 0.0
 
         left = ttk.Frame(self)
         left.pack(side="left", fill="y", padx=8, pady=8)
@@ -3268,6 +1863,7 @@ class TrafficPanel(ttk.Frame):
                           activebackground=C["accent"], activeforeground=C["bg"],
                           relief="flat", font=UI_FONT, cursor="hand2")
             b.pack(side="left", expand=True, fill="x", padx=2)
+            attach_hover(b, C["panel2"], C["fg"])
 
         self.stats = tk.Text(left, width=28, height=10, bg=C["panel2"], fg=C["fg"],
                              font=MONO, relief="flat", state="disabled",
@@ -3282,6 +1878,17 @@ class TrafficPanel(ttk.Frame):
 
         threading.Thread(target=self._sampler, daemon=True).start()
         self.after(1500, self.sample)
+        self.after(420, self._anim)
+
+    def _anim(self):
+        """Pulse the live-chart markers while this tab is visible."""
+        try:
+            if self.winfo_exists() and self.app.nb.select() == str(self):
+                self._pulse += 0.55
+                self.draw()
+        except Exception:
+            pass
+        self.after(420, self._anim)
 
     # -- sampling -----------------------------------------------------------
     def sample(self):
@@ -3398,7 +2005,17 @@ class TrafficPanel(ttk.Frame):
                     y = pad_t + plot_h * (1 - min(1.0, v / top))
                     pts.extend((x, y))
                 if len(pts) >= 4:
+                    base_y = pad_t + plot_h
+                    # soft area fill + glow under the line
+                    cv.create_polygon(*pts, pts[-2], base_y, pts[0], base_y,
+                                      fill=blend(color, C["bg"], 0.16), outline="")
+                    cv.create_line(*pts, fill=blend(color, C["bg"], 0.55), width=5,
+                                   smooth=True)
                     cv.create_line(*pts, fill=color, width=2, smooth=True)
+                    # pulsing dot at the leading edge
+                    r = 3 + 2.2 * (0.5 + 0.5 * math.sin(self._pulse))
+                    cv.create_oval(pts[-2] - r, pts[-1] - r, pts[-2] + r, pts[-1] + r,
+                                   fill=color, outline=blend(color, C["bg"], 0.4))
             cur_rx, cur_tx = data[-1]
             stats_lines.append(f"{n}")
             stats_lines.append(f"  ↓ {fmt_rate(cur_rx)}")
@@ -3414,6 +2031,12 @@ class TrafficPanel(ttk.Frame):
             cv.create_rectangle(lx, ly - 5, lx + 14, ly + 5, fill=col, outline=col)
             cv.create_text(lx + 20, ly, text=label, anchor="w", fill=C["dim"], font=UI_FONT)
             lx += 130
+
+        # pulsing LIVE badge
+        r = 3 + 2.6 * (0.5 + 0.5 * math.sin(self._pulse))
+        cv.create_oval(w - 82 - r, 14 - r, w - 82 + r, 14 + r,
+                       fill=C["err"], outline="")
+        cv.create_text(w - 72, 14, text="LIVE", anchor="w", fill=C["err"], font=UI_FONT)
 
         self.stats.configure(state="normal")
         self.stats.delete("1.0", "end")
@@ -3685,6 +2308,7 @@ class PingGraphPanel(ttk.Frame):
         self.running = False
         self.stop_ev = threading.Event()
         self.window = 180      # points shown
+        self._pulse = 0.0
 
         top = tk.Frame(self, bg=C["bg"])
         top.pack(fill="x", pady=(0, 6))
@@ -3711,10 +2335,12 @@ class PingGraphPanel(ttk.Frame):
                                ("■ Stop", self.stop, C["err"]),
                                ("Reset", self.reset, C["panel2"]),
                                ("Export CSV", self.export, C["panel2"])):
-            tk.Button(opts, text=label, command=fn, bg=col,
-                      fg=C["bg"] if col in (C["accent"], C["err"]) else C["fg"],
-                      activebackground=C["border"], relief="flat", font=UI_FONT,
-                      cursor="hand2", padx=10).pack(side="left", padx=3)
+            b = tk.Button(opts, text=label, command=fn, bg=col,
+                          fg=C["bg"] if col in (C["accent"], C["err"]) else C["fg"],
+                          activebackground=C["border"], relief="flat", font=UI_FONT,
+                          cursor="hand2", padx=10)
+            b.pack(side="left", padx=3)
+            attach_hover(b, col, C["bg"] if col in (C["accent"], C["err"]) else C["fg"])
 
         body = tk.Frame(self, bg=C["bg"])
         body.pack(fill="both", expand=True)
@@ -3725,6 +2351,17 @@ class PingGraphPanel(ttk.Frame):
                              relief="flat", state="disabled", highlightthickness=1,
                              highlightbackground=C["border"])
         self.stats.pack(side="right", fill="y", padx=(6, 0))
+        self.after(420, self._anim)
+
+    def _anim(self):
+        """Pulse the line-end markers while this tab is visible."""
+        try:
+            if self.winfo_exists() and self.app.nb.select() == str(self):
+                self._pulse += 0.55
+                self.draw()
+        except Exception:
+            pass
+        self.after(420, self._anim)
 
     # -- control ------------------------------------------------------------
     def start(self):
@@ -3845,13 +2482,19 @@ class PingGraphPanel(ttk.Frame):
                     y = pad_t + plot_h * (1 - min(1.0, ms / top_v))
                     seg.extend((x, y))
             if len(seg) >= 4:
+                cv.create_line(*seg, fill=blend(color, C["bg"], 0.5), width=6)
                 cv.create_line(*seg, fill=color, width=2)
             for x in gap:
                 cv.create_line(x, pad_t, x, pad_t + plot_h, fill=C["err"], dash=(2, 4))
-            # end-of-line label
+            # end-of-line label + pulsing dot
             ok = [ms for _ts, ms in pts_data if ms is not None]
             last = ok[-1] if ok else None
             y_end = (pad_t + plot_h * (1 - min(1.0, last / top_v))) if last is not None else pad_t + 8
+            if last is not None:
+                r = 2.6 + 2.2 * (0.5 + 0.5 * math.sin(self._pulse + idx))
+                cv.create_oval(pad_l + plot_w - r, y_end - r,
+                               pad_l + plot_w + r, y_end + r,
+                               fill=color, outline=blend(color, C["bg"], 0.4))
             cv.create_text(pad_l + plot_w + 6, y_end, text=label[:18], anchor="w",
                            fill=color, font=("Consolas" if IS_WIN else "Menlo", 8))
             loss = 100.0 * (n - len(ok)) / max(1, n)
@@ -3899,210 +2542,12 @@ class PingGraphPanel(ttk.Frame):
 # ----------------------------------------------------------------------------
 # Main application
 # ----------------------------------------------------------------------------
-class ProtocolPanel(ttk.Frame):
-    """UI panel for running the added protocol tests."""
-
-    def __init__(self, master, app):
-        super().__init__(master)
-        self.app = app
-        self._stop = threading.Event()
-        self._busy = False
-
-        left = tk.Frame(self, bg=C["bg"])
-        left.pack(side="left", fill="y", padx=8, pady=8)
-
-        tk.Label(
-            left, text="Protocols", bg=C["bg"], fg=C["accent"],
-            font=(UI_FONT[0], UI_FONT[1], "bold")
-        ).pack(anchor="w")
-
-        self.listbox = tk.Listbox(
-            left, width=26, height=28,
-            bg=C["panel2"], fg=C["fg"],
-            selectbackground=C["accent"], selectforeground=C["bg"],
-            font=UI_FONT, exportselection=False,
-            relief="flat", highlightthickness=1,
-            highlightbackground=C["border"]
-        )
-        self.listbox.pack(fill="both", expand=True, pady=4)
-
-        for name in PROTOCOL_TESTS:
-            self.listbox.insert("end", name)
-
-        self.listbox.select_set(0)
-        self.listbox.bind("<<ListboxSelect>>", self._select)
-
-        right = ttk.Frame(self)
-        right.pack(side="left", fill="both", expand=True, padx=8, pady=8)
-
-        bar = tk.Frame(right, bg=C["bg"])
-        bar.grid(row=0, column=0, columnspan=2, sticky="ew")
-
-        tk.Label(bar, text="Target:", bg=C["bg"], fg=C["accent"], font=UI_FONT).pack(side="left")
-        self.target_var = tk.StringVar(value="example.com")
-        tk.Entry(
-            bar, textvariable=self.target_var, width=34,
-            bg=C["panel2"], fg=C["fg"], insertbackground=C["fg"],
-            relief="flat", font=MONO
-        ).pack(side="left", padx=6)
-
-        tk.Label(bar, text="Port:", bg=C["bg"], fg=C["dim"], font=UI_FONT).pack(side="left")
-        self.port_var = tk.StringVar(value="80")
-        tk.Entry(
-            bar, textvariable=self.port_var, width=7,
-            bg=C["panel2"], fg=C["fg"], insertbackground=C["fg"],
-            relief="flat", font=MONO
-        ).pack(side="left", padx=6)
-
-        for label, fn, col in (
-            ("▶ Run", self.run, C["accent"]),
-            ("■ Stop", self.stop, C["err"]),
-            ("Clear", self.clear, C["panel2"]),
-            ("Copy", self.copy, C["panel2"]),
-        ):
-            tk.Button(
-                bar, text=label, command=fn, bg=col,
-                fg=C["bg"] if col in (C["accent"], C["err"]) else C["fg"],
-                activebackground=C["border"], relief="flat",
-                font=UI_FONT, cursor="hand2", padx=8
-            ).pack(side="left", padx=3)
-
-        self.note_var = tk.StringVar(value="")
-        tk.Label(
-            right, textvariable=self.note_var, bg=C["bg"], fg=C["warn"],
-            font=UI_FONT, anchor="w"
-        ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
-
-        self.out = tk.Text(
-            right, bg=C["bg"], fg=C["fg"], insertbackground=C["fg"],
-            font=MONO, relief="flat", wrap="none", padx=8, pady=6
-        )
-        ys = ttk.Scrollbar(right, orient="vertical", command=self.out.yview)
-        xs = ttk.Scrollbar(right, orient="horizontal", command=self.out.xview)
-        self.out.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
-
-        self.out.grid(row=2, column=0, sticky="nsew")
-        ys.grid(row=2, column=1, sticky="ns")
-        xs.grid(row=3, column=0, sticky="ew")
-
-        right.rowconfigure(2, weight=1)
-        right.columnconfigure(0, weight=1)
-
-        self.out.tag_configure("cmd", foreground=C["cmd"], font=(MONO[0], MONO[1], "bold"))
-        self.out.tag_configure("ok", foreground=C["ok"])
-        self.out.tag_configure("warn", foreground=C["warn"])
-        self.out.tag_configure("err", foreground=C["err"], font=(MONO[0], MONO[1], "bold"))
-        self.out.tag_configure("info", foreground=C["dim"])
-        self.out.tag_configure("head", foreground=C["head"])
-
-        self.after(50, self._select)
-
-    def _select(self, event=None):
-        sel = self.listbox.curselection()
-        if not sel:
-            return
-        name = self.listbox.get(sel[0])
-        meta = PROTOCOL_TESTS.get(name, {})
-        port = meta.get("port")
-        self.port_var.set("" if not port else str(port))
-        self.note_var.set(meta.get("note", ""))
-
-    def select_protocol(self, name):
-        names = list(PROTOCOL_TESTS.keys())
-        if name not in names:
-            return
-        idx = names.index(name)
-        self.listbox.select_clear(0, "end")
-        self.listbox.select_set(idx)
-        self.listbox.see(idx)
-        self._select()
-
-    def write(self, line, tag="head"):
-        self.out.insert("end", line + "\n", tag)
-        self.out.see("end")
-
-    def write_safe(self, line, tag="head"):
-        try:
-            self.after(0, lambda: self.write(line, tag))
-        except Exception:
-            pass
-
-    def clear(self):
-        self.out.delete("1.0", "end")
-
-    def copy(self):
-        try:
-            sel = self.out.get("sel.first", "sel.last")
-        except Exception:
-            sel = self.out.get("1.0", "end")
-        self.clipboard_clear()
-        self.clipboard_append(sel)
-        self.app.status("protocol output copied to clipboard")
-
-    def stop(self):
-        self._stop.set()
-        self.write_safe("■ stop requested", "warn")
-
-    def run(self):
-        if self._busy:
-            self.app.status("protocol test already running")
-            return
-
-        sel = self.listbox.curselection() or (0,)
-        name = self.listbox.get(sel[0])
-        meta = PROTOCOL_TESTS[name]
-
-        target = self.target_var.get().strip() or "example.com"
-        port_raw = self.port_var.get().strip()
-
-        try:
-            port = int(port_raw) if port_raw else int(meta.get("port") or 0)
-        except Exception:
-            port = int(meta.get("port") or 0)
-
-        self._stop.clear()
-        self._busy = True
-
-        self.write("─" * 78, "info")
-        self.write(f"[{now()}] protocol test: {name} target={target or '-'} port={port or '-'}", "cmd")
-
-        threading.Thread(target=self._work, args=(name, target, port), daemon=True).start()
-
-    def _work(self, name, target, port):
-        meta = PROTOCOL_TESTS[name]
-        fn = meta["fn"]
-
-        try:
-            res = fn(target, port, self._stop)
-            if not isinstance(res, dict):
-                res = {"ok": bool(res), "result": res}
-
-            res.setdefault("protocol", name)
-            ok = bool(res.get("ok"))
-
-            self.write_safe(f"RESULT: {'PASS' if ok else 'FAIL'}", "ok" if ok else "err")
-
-            if res.get("summary"):
-                self.write_safe(f"summary: {res['summary']}", "warn")
-
-            if res.get("error"):
-                self.write_safe(f"error: {res['error']}", "err")
-
-            for k, v in res.items():
-                if k in ("ok", "summary", "error"):
-                    continue
-                self.write_safe(f"{k}: {_short_text(v, 220)}", "head")
-
-        except Exception as e:
-            self.write_safe("RESULT: FAIL", "err")
-            self.write_safe(f"error: {e}", "err")
-        finally:
-            self._busy = False
-            self.write_safe(f"✔ {name} test finished", "ok")
-
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
+        self.theme_name = load_theme_name()
+        if self.theme_name in THEMES:
+            C.update(THEMES[self.theme_name])
         self.title(f"{APP_NAME} v{VERSION} — Portable Network Testing & Traffic Analysis")
         self.geometry("1280x820")
         self.minsize(1024, 680)
@@ -4114,8 +2559,10 @@ class App(tk.Tk):
         self._build_style()
         self._build_ui()
         self._bind_keys()
+        self.protocol("WM_DELETE_WINDOW", self._close_animated)
         self.after(100, self._poll)
         self.after(300, self._intro)
+        self._fade(0.0, 1.0)          # smooth window fade-in
 
     # -- styling ------------------------------------------------------------
     def _build_style(self):
@@ -4169,6 +2616,23 @@ class App(tk.Tk):
                                ("Copy", self.copy_terminal, C["panel2"])):
             self._btn(top, label, fn, col).pack(side="left", padx=4, pady=6)
 
+        # theme picker (background + text colours, applied live)
+        tk.Label(top, text="Theme:", bg=C["panel"], fg=C["dim"],
+                 font=UI_FONT).pack(side="right", padx=(8, 2))
+        self.theme_var = tk.StringVar(value=self.theme_name)
+        self.theme_opt = tk.OptionMenu(top, self.theme_var, *THEME_NAMES,
+                                       command=self._on_theme_pick)
+        self.theme_opt.configure(bg=C["panel2"], fg=C["fg"], activebackground=C["accent"],
+                                 activeforeground=C["bg"], highlightthickness=0,
+                                 relief="flat", font=UI_FONT, width=15,
+                                 indicatoron=False, cursor="hand2")
+        self.theme_opt["menu"].configure(bg=C["panel2"], fg=C["fg"],
+                                         activebackground=C["accent"],
+                                         activeforeground=C["bg"], relief="flat",
+                                         font=UI_FONT)
+        self.theme_opt.pack(side="right", padx=4, pady=6)
+        attach_hover(self.theme_opt, C["panel2"], C["fg"])
+
         # body: sidebar + notebook
         body = ttk.Frame(self)
         body.pack(fill="both", expand=True, padx=8, pady=4)
@@ -4212,8 +2676,7 @@ class App(tk.Tk):
                           activeforeground=C["bg"], relief="flat", font=MONO,
                           cursor="hand2", pady=4)
             b.pack(fill="x", padx=8, pady=1)
-            b.bind("<Enter>", lambda e, bb=b: bb.configure(bg=C["border"]))
-            b.bind("<Leave>", lambda e, bb=b: bb.configure(bg=C["panel2"]))
+            attach_hover(b, C["panel2"], C["fg"], lift=0.10)
             self.actions.append((label, fn))
 
         section("QUICK TESTS")
@@ -4257,21 +2720,6 @@ class App(tk.Tk):
         action("DNS Compare         Ctrl+N", self.run_dns_compare)
         action("Top Talkers         Ctrl+J", self.run_top_talkers)
 
-        section("PROFESSIONAL")
-        action("TLS/Cert Inspector   Ctrl+Shift+C", self.run_tls_inspect)
-        action("DNS Record Browser   Ctrl+Shift+D", self.run_dns_records)
-        action("Latency Stats (50)   Ctrl+Shift+L", self.run_latency_stats)
-        action("TCP State Analyzer   Ctrl+Shift+S", self.run_tcp_states)
-        action("ECMP/Path-Flap       Ctrl+Shift+F", self.run_ecmp)
-        action("Wi-Fi Channel Survey Ctrl+Shift+A", self.run_wifi_survey)
-        action("Link/NIC Watch 60s   Ctrl+Shift+K", self.run_link_watch)
-        action("VPN/Split-Tunnel     Ctrl+Shift+B", self.run_vpn_report)
-        action("Long-Run Logger CSV  Ctrl+Shift+N", self.run_longrun)
-        action("Report Generator     Ctrl+Shift+O", self.run_report)
-
-        section("PROTOCOL TESTS")
-        action("Protocol Test Panel", self.show_protocols)
-
         section("CUSTOM COMMAND")
         self.custom_var = tk.StringVar(value="netstat -an")
         tk.Entry(side_in, textvariable=self.custom_var, bg=C["panel2"], fg=C["fg"],
@@ -4308,9 +2756,6 @@ class App(tk.Tk):
         self.matrix = MatrixPanel(self.nb, self)
         self.nb.add(self.matrix, text="  Multi-Host Matrix  ")
 
-        self.protocols = ProtocolPanel(self.nb, self)
-        self.nb.add(self.protocols, text="  Protocol Tests  ")
-
         # status bar
         self.status_var = tk.StringVar(value="ready")
         bar = tk.Frame(self, bg=C["panel"], highlightthickness=1,
@@ -4320,13 +2765,17 @@ class App(tk.Tk):
                  font=UI_FONT, anchor="w").pack(side="left", fill="x", expand=True, padx=10, pady=4)
         self.netstat_label = tk.Label(bar, text="", bg=C["panel"], fg=C["dim"], font=MONO)
         self.netstat_label.pack(side="right", padx=10)
+        self.spin_label = tk.Label(bar, text="●", bg=C["panel"], fg=C["dim"], font=MONO)
+        self.spin_label.pack(side="right", padx=(0, 2))
         self._tick_status()
+        self._spin_tick()
 
     def _btn(self, parent, text, cmd, color):
         b = tk.Button(parent, text=text, command=cmd, bg=color,
                       fg=C["bg"] if color in (C["accent"], C["err"]) else C["fg"],
                       activebackground=C["border"], activeforeground=C["fg"],
                       relief="flat", font=UI_FONT, cursor="hand2", padx=12, pady=3)
+        attach_hover(b, color, C["bg"] if color in (C["accent"], C["err"]) else C["fg"])
         return b
 
     def _bind_keys(self):
@@ -4372,17 +2821,7 @@ class App(tk.Tk):
         b("<Control-W>", lambda e: self.run_wifi_watch())
         b("<Control-E>", lambda e: self.run_error_watch())
         b("<Control-T>", lambda e: self.nb.select(self.terminals))
-        # professional toolkit (Ctrl+Shift)
-        b("<Control-C>", lambda e: self.run_tls_inspect())
-        b("<Control-D>", lambda e: self.run_dns_records())
-        b("<Control-L>", lambda e: self.run_latency_stats())
-        b("<Control-S>", lambda e: self.run_tcp_states())
-        b("<Control-F>", lambda e: self.run_ecmp())
-        b("<Control-A>", lambda e: self.run_wifi_survey())
-        b("<Control-K>", lambda e: self.run_link_watch())
-        b("<Control-B>", lambda e: self.run_vpn_report())
-        b("<Control-N>", lambda e: self.run_longrun())
-        b("<Control-O>", lambda e: self.run_report())
+        b("<Control-N>", lambda e: self.cycle_theme())   # Ctrl+Shift+N: next theme
         b("<F5>", lambda e: self.run_selected())
 
     # -- helpers ------------------------------------------------------------
@@ -4400,6 +2839,110 @@ class App(tk.Tk):
         except Exception:
             return 4
 
+    # -- themes -------------------------------------------------------------
+    def _on_theme_pick(self, name):
+        self.apply_theme(name)
+
+    def cycle_theme(self):
+        i = THEME_NAMES.index(self.theme_name) if self.theme_name in THEME_NAMES else 0
+        self.apply_theme(THEME_NAMES[(i + 1) % len(THEME_NAMES)])
+
+    def apply_theme(self, name, animate=True):
+        """Switch the background/text palette; widgets morph smoothly."""
+        if name not in THEMES:
+            return
+        old = dict(C)
+        target = THEMES[name]
+        self.theme_name = name
+        try:
+            self.theme_var.set(name)
+        except Exception:
+            pass
+        save_theme_name(name)
+        if not animate:
+            C.update(target)
+            self._restyle(old, target)
+            return
+        steps = 8
+
+        def tick(i=0):
+            t = i / steps
+            t = t * t * (3 - 2 * t)                 # smoothstep easing
+            step = {k: lerp_color(old[k], target[k], t) for k in target}
+            self._restyle(C, step)                  # C = colours on screen now
+            C.update(step)
+            if i < steps:
+                self.after(18, tick, i + 1)
+        tick()
+
+    def _restyle(self, old, new):
+        old2new = {str(old[k]).lower(): new[k] for k in new
+                   if isinstance(old.get(k), str)}
+        try:
+            self.configure(bg=new["bg"])
+            self._build_style()
+            recolor_widget_tree(self, old2new)
+        except Exception:
+            pass
+        for panel in (getattr(self, "traffic", None), getattr(self, "pinggraph", None)):
+            try:
+                if panel is not None:
+                    panel.canvas.configure(bg=new["bg"],
+                                           highlightbackground=new["border"])
+                    panel.draw()
+            except Exception:
+                pass
+        try:
+            self.theme_opt.configure(bg=new["panel2"], fg=new["fg"],
+                                     activebackground=new["accent"],
+                                     activeforeground=new["bg"])
+            self.theme_opt["menu"].configure(bg=new["panel2"], fg=new["fg"],
+                                             activebackground=new["accent"],
+                                             activeforeground=new["bg"])
+        except Exception:
+            pass
+
+    # -- window fade / spinner ---------------------------------------------
+    def _fade(self, a: float, b: float, steps: int = 8, done=None):
+        try:
+            self.attributes("-alpha", a)
+        except Exception:
+            if done:
+                done()
+            return
+
+        def tick(i=0):
+            t = min(1.0, i / steps)
+            t = t * t * (3 - 2 * t)
+            try:
+                if not self.winfo_exists():
+                    return
+                self.attributes("-alpha", a + (b - a) * t)
+            except Exception:
+                return
+            if i < steps:
+                self.after(18, tick, i + 1)
+            elif done:
+                done()
+        tick()
+
+    def _close_animated(self):
+        self._fade(1.0, 0.0, steps=8, done=self.destroy)
+
+    def _spin_tick(self, i=0):
+        """Animated busy indicator in the status bar."""
+        try:
+            busy = self.monitor_running or any(
+                v._status_text == "running" for v in self.terminals.all_views())
+            if busy:
+                self.spin_label.configure(text=SPIN_FRAMES[i % len(SPIN_FRAMES)],
+                                          fg=C["accent"])
+            else:
+                self.spin_label.configure(text="●", fg=C["dim"])
+        except Exception:
+            pass
+        self.after(120, self._spin_tick, i + 1)
+
     def status(self, text: str):
         self.status_var.set(f"[{now()}] {text}")
 
@@ -4416,67 +2959,115 @@ class App(tk.Tk):
         self.netstat_label.configure(text="   ".join(extra))
         self.after(3000, self._tick_status)
 
+    _BANNER = [
+        "  ███╗   ██╗███████╗████████╗██████╗ ██████╗  ██████╗ ██████╗ ███████╗",
+        "  ████╗  ██║██╔════╝╚══██╔══╝██╔══██╗██╔══██╗██╔═══██╗██╔══██╗██╔════╝",
+        "  ██╔██╗ ██║█████╗     ██║   ██████╔╝██████╔╝██║   ██║██████╔╝█████╗  ",
+        "  ██║╚██╗██║██╔══╝     ██║   ██╔═══╝ ██╔══██╗██║   ██║██╔══██╗██╔══╝  ",
+        "  ██║ ╚████║███████╗   ██║   ██║     ██║  ██║╚██████╔╝██║  ██║███████╗",
+        "  ╚═╝  ╚═══╝╚══════╝   ╚═╝   ╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝",
+    ]
+
     def _intro(self):
-        self.terminal.write(f"{APP_NAME} v{VERSION} — portable network testing suite", "title")
-        self.terminal.write(f"host: {platform.node()} | {platform.system()} {platform.release()} "
-                            f"| python {platform.python_version()}", "info")
-        self.terminal.write(f"psutil: {'yes' if HAVE_PSUTIL else 'NO (pip install psutil)'}", "info")
-        self.terminal.write("Shortcuts: Ctrl+1..9 tests · Ctrl+D full diagnose · Ctrl+M matrix · "
-                            "Ctrl+T traffic · Ctrl+S save · F5 run", "info")
-        self.terminal.write("Select a test on the left, or press a shortcut key.", "warn")
-        self.terminal.write("─" * 78, "info")
+        """Animated startup: banner reveal → typewriter tagline → staggered tips."""
+        pane = self.terminal
+
+        def after_typed():
+            lines = [
+                (f"  host: {platform.node()} | {platform.system()} {platform.release()} "
+                 f"| python {platform.python_version()}", "info"),
+                (f"  psutil: {'yes' if HAVE_PSUTIL else 'NO (pip install psutil)'}", "info"),
+                ("  Shortcuts: Ctrl+1..9 tests · Ctrl+D full diagnose · Ctrl+M matrix · "
+                 "Ctrl+T traffic · Ctrl+S save · F5 run", "info"),
+                ("  Themes: pick one in the top bar, or Ctrl+Shift+N to cycle", "info"),
+                ("  Select a test on the left, or press a shortcut key.", "warn"),
+                ("─" * 78, "info"),
+            ]
+
+            def step(i=0):
+                if i < len(lines):
+                    pane.write(*lines[i])
+                    self.after(110, step, i + 1)
+            step()
+
+        def reveal(i=0):
+            if i < len(self._BANNER):
+                pane.write(self._BANNER[i], "title")
+                self.after(45, reveal, i + 1)
+            else:
+                pane.write("", "info")
+                pane.type_text(
+                    f"  {APP_NAME} v{VERSION} — portable network testing suite",
+                    "cmd", speed=8, done=after_typed)
+
+        reveal()
 
     # -- queue / terminal ---------------------------------------------------
     def _poll(self):
+        # This loop is the app's lifeline — it must survive every bad event
+        # (e.g. output for a terminal the user closed), otherwise all quick
+        # commands silently stop working.  Re-arm unconditionally.
         try:
             while True:
-                item = self.queue.get_nowait()
-                kind = item[0]
-                if kind == "line":
-                    _, tag, text = item
-                    self.terminal.write(text, tag)
-                elif kind == "cmd":
-                    _, cmd = item
-                    self.terminal.banner(cmd)
-                elif kind == "done":
-                    self.status(item[1])
-                    self.terminal.write(f"✔ {item[1]}", "ok")
-                elif kind == "term":
-                    _, pane, tag, text = item
-                    pane.write(text, tag)
-                elif kind == "term_cmd":
-                    _, pane, cmd = item
-                    pane.banner(cmd)
-                elif kind == "term_status":
-                    _, pane, st = item
-                    pane.set_status(st)
-                elif kind == "term_done":
-                    _, pane, msg = item
-                    pane.write(f"✔ {msg}", "ok")
-                    pane.set_status("idle")
-                    self.status(f"[{pane.name}] {msg}")
-                elif kind == "matrix":
-                    self.matrix.add_row(item[1])
-                elif kind == "http":
-                    self._print_http(item[2], item[1])
-                elif kind == "speed":
-                    self._print_speed(item[2], item[1])
-                elif kind == "traffic":
-                    _, name, rxb, txb, rxt, txt = item
-                    self.traffic.push(name, rxb, txb, rxt, txt)
-                elif kind == "traffic_hint":
-                    self.traffic.draw()
-                elif kind == "pinggraph":
-                    _, label, ts, ms = item
-                    self.pinggraph.push(label, ts, ms)
-                elif kind == "pinggraph_done":
-                    self.status("ping graph finished")
-                elif kind == "table":
-                    for ln in item[1]:
-                        self.terminal.write(ln, "head")
-        except queue.Empty:
-            pass
-        self.after(100, self._poll)
+                try:
+                    item = self.queue.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    self._dispatch(item)
+                except Exception:
+                    pass
+        finally:
+            self.after(100, self._poll)
+
+    def _dispatch(self, item):
+        kind = item[0]
+        if kind == "line":
+            _, tag, text = item
+            self.terminal.write(text, tag)
+        elif kind == "cmd":
+            _, cmd = item
+            self.terminal.banner(cmd)
+        elif kind == "done":
+            self.status(item[1])
+            self.terminal.write(f"✔ {item[1]}", "ok")
+        elif kind == "term":
+            _, pane, tag, text = item
+            pane.write(text, tag)
+        elif kind == "term_cmd":
+            _, pane, cmd = item
+            pane.banner(cmd)
+        elif kind == "term_status":
+            _, pane, st = item
+            pane.set_status(st)
+        elif kind == "term_prog":
+            _, pane, frac, label = item
+            pane.set_progress(frac, label)
+        elif kind == "term_done":
+            _, pane, msg = item
+            pane.clear_progress()
+            pane.write(f"✔ {msg}", "ok")
+            pane.set_status("idle")
+            self.status(f"[{pane.name}] {msg}")
+        elif kind == "matrix":
+            self.matrix.add_row(item[1])
+        elif kind == "http":
+            self._print_http(item[2], item[1])
+        elif kind == "speed":
+            self._print_speed(item[2], item[1])
+        elif kind == "traffic":
+            _, name, rxb, txb, rxt, txt = item
+            self.traffic.push(name, rxb, txb, rxt, txt)
+        elif kind == "traffic_hint":
+            self.traffic.draw()
+        elif kind == "pinggraph":
+            _, label, ts, ms = item
+            self.pinggraph.push(label, ts, ms)
+        elif kind == "pinggraph_done":
+            self.status("ping graph finished")
+        elif kind == "table":
+            for ln in item[1]:
+                self.terminal.write(ln, "head")
 
     def _print_http(self, r: dict, pane=None):
         t = pane or self.terminal
@@ -4514,6 +3105,9 @@ class App(tk.Tk):
     # -- command execution --------------------------------------------------
     def run_cmd(self, cmd: list, pane=None):
         pane = pane or self.terminal
+        if pane is None or not pane._alive():
+            self.status("no terminal available")
+            return
         if pane.proc and pane.proc.poll() is None:
             self.status(f"[{pane.name}] busy — press ■ Stop first")
             return
@@ -4530,7 +3124,13 @@ class App(tk.Tk):
                 if pane.stop_flag.is_set():
                     break
                 self.queue.put(("term", pane, "head", line.rstrip("\n")))
-            pane.proc.wait(timeout=30)
+            try:
+                pane.proc.wait(timeout=600)
+            except Exception:
+                try:
+                    pane.proc.kill()
+                except Exception:
+                    pass
             self.queue.put(("term_done", pane,
                             f"finished (exit {pane.proc.returncode}) — "
                             f"{' '.join(str(c) for c in cmd)}"))
@@ -4585,6 +3185,17 @@ class App(tk.Tk):
         if seconds:
             self.queue.put(("term", pane, "info",
                             f"  (auto-stops after {seconds}s — press ■ Stop to end earlier)"))
+            t0 = time.time()
+
+            def prog_tick():
+                if not self.monitor_running:
+                    return
+                frac = min(1.0, (time.time() - t0) / max(1.0, seconds))
+                self.queue.put(("term_prog", pane, frac,
+                                f"{max(0, seconds - (time.time() - t0)):.0f}s left"))
+                if frac < 1.0:
+                    self.after(400, prog_tick)
+            self.after(400, prog_tick)
 
         def emit(t, tag="head"):
             self.queue.put(("term", pane, tag, t))
@@ -4810,102 +3421,6 @@ class App(tk.Tk):
             e(f"  iface errors: {', '.join(dirty) if dirty else 'clean'}")
         self._monitor_thread([f"SUPER DIAGNOSTIC — {h}"], job, "super diagnostic finished")
 
-    def run_tls_inspect(self):
-        h = self.host()
-
-        def job(pane, e):
-            r = tls_inspect(h)
-            if r.get("error"):
-                e(f"  ✖ {r['error']}")
-                return
-            e(f"  {h} ({r.get('ip')})  —  TLS {r.get('protocol')} / {r.get('cipher')}")
-            e(f"  handshake       : {r.get('handshake_ms', 0):.1f} ms")
-            e(f"  cert verified   : {r.get('verified')}"
-              + (f"   ({r.get('verify_error')})" if r.get("verify_error") else ""))
-            e(f"  subject CN      : {r.get('subject', {}).get('commonName', '-')}")
-            e(f"  issuer          : {r.get('issuer', {}).get('organizationName', '-')} "
-              f"/ {r.get('issuer', {}).get('commonName', '-')}")
-            e(f"  valid           : {r.get('not_before')}  →  {r.get('not_after')}")
-            days = r.get("days_left")
-            if days is not None:
-                tag = "⚠ EXPIRES SOON" if days < 21 else "ok"
-                e(f"  days remaining  : {days}   [{tag}]")
-            e(f"  serial          : {r.get('serial', '-')}")
-            e(f"  SANs            : {', '.join(r.get('sans', []) or ['-'])}")
-            url = h if re.match(r"^https?://", h, re.I) else f"https://{h}"
-            hp = http_probe(url)
-            headers = hp.get("headers", {})
-            if headers:
-                e("  HTTP response headers:")
-                for k in sorted(headers):
-                    e(f"    {k:24s}: {headers[k][:70]}")
-        self._monitor_thread([f"TLS / certificate inspection — {h}"], job,
-                             "TLS inspection finished")
-
-    def run_dns_records(self):
-        h = self.host()
-
-        def job(pane, e):
-            rows = dns_records(h)
-            e(f"  {'TYPE':<7}{'TTL':<8}NAME / VALUE")
-            for t, n2, v, ttl in rows:
-                e(f"  {t:<7}{str(ttl):<8}{n2[:40]:<42}{str(v)[:64]}")
-        self._monitor_thread([f"DNS record browser — {h} (via 1.1.1.1)"], job,
-                             "DNS record browser finished")
-
-    def run_latency_stats(self):
-        h = self.host()
-        self._monitor_thread(
-            [f"latency statistics — {h} (50 samples)"],
-            lambda pane, e: latency_stats(e, h, samples=50, stop=self.stop_flag),
-            f"latency profile complete for {h}")
-
-    def run_tcp_states(self):
-        self._monitor_thread(
-            ["TCP state analyzer + transport counters"],
-            lambda pane, e: tcp_state_analyze(e),
-            "TCP state analysis finished")
-
-    def run_ecmp(self):
-        h = self.host()
-        self._monitor_thread(
-            [f"ECMP / path-flap detector — {h} (3 traceroutes)"],
-            lambda pane, e: ecmp_trace(e, h, rounds=3, stop=self.stop_flag),
-            f"ECMP analysis finished for {h}", seconds=90)
-
-    def run_wifi_survey(self):
-        self._monitor_thread(
-            ["Wi-Fi channel survey — nearby APs & congestion"],
-            lambda pane, e: wifi_survey_report(e),
-            "Wi-Fi survey finished")
-
-    def run_link_watch(self):
-        self._monitor_thread(
-            ["link / NIC state watch (60 s)"],
-            lambda pane, e: link_watch(e, seconds=60.0, stop=self.stop_flag),
-            "link watch finished (60s)", seconds=60)
-
-    def run_vpn_report(self):
-        self._monitor_thread(
-            ["VPN / split-tunnel report"],
-            lambda pane, e: vpn_report(e),
-            "VPN report finished")
-
-    def run_longrun(self):
-        h = self.host()
-        self._monitor_thread(
-            [f"long-run logger — {h} (10 min, CSV)"],
-            lambda pane, e: longrun_logger(e, h, minutes=10.0, interval=5.0,
-                                           stop=self.stop_flag),
-            f"long-run log complete for {h}", seconds=620)
-
-    def run_report(self):
-        h = self.host()
-        self._monitor_thread(
-            [f"diagnostic report generator — {h}"],
-            lambda pane, e: generate_report(e, h),
-            f"report generated for {h}")
-
     def run_listening_ports(self):
         pane = self.terminal
         self.queue.put(("term_cmd", pane, ["listening ports (local machine)"]))
@@ -4956,11 +3471,23 @@ class App(tk.Tk):
     def run_speed_test(self):
         pane = self.terminal
         self.queue.put(("term_cmd", pane, ["speed-test"]))
+        self.queue.put(("term_status", pane, "running"))
         self.status("running speed test (~20–40 s)")
 
         def work():
-            r = speed_test(emit=lambda t: self.queue.put(("term", pane, "info", t)))
+            last_ui = [0.0]
+
+            def prog(frac, label):
+                ts = time.time()
+                if frac < 1.0 and ts - last_ui[0] < 0.15:
+                    return
+                last_ui[0] = ts
+                self.queue.put(("term_prog", pane, frac, label))
+
+            r = speed_test(emit=lambda t: self.queue.put(("term", pane, "info", t)),
+                           progress=prog)
             self.queue.put(("speed", pane, r))
+            self.queue.put(("term_done", pane, "speed test complete"))
         threading.Thread(target=work, daemon=True).start()
 
     def run_full_diagnose(self):
@@ -5003,14 +3530,6 @@ class App(tk.Tk):
     # -- tabs ---------------------------------------------------------------
     def show_matrix(self):
         self.nb.select(self.matrix)
-
-    def show_protocols(self):
-        self.nb.select(self.protocols)
-
-    def quick_protocol(self, name):
-        self.show_protocols()
-        self.protocols.select_protocol(name)
-        self.protocols.run()
 
     def show_pinggraph(self):
         self.nb.select(self.pinggraph)
