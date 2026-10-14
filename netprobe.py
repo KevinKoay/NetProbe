@@ -1554,6 +1554,834 @@ def shutil_which(x: str):
 
 
 # ----------------------------------------------------------------------------
+# Protocol Lab — per-protocol tests grouped by OSI layer
+# ----------------------------------------------------------------------------
+# Every test has the signature  fn(host, emit, stop) -> (status, summary)
+#   status ∈ "PASS" | "WARN" | "FAIL" | "INFO"
+#   emit(line, tag) writes a detail line (tag: head/ok/warn/err/info/title)
+
+def _short_host(host: str) -> str:
+    h = (host or "").strip()
+    m = re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", h)
+    if m:
+        h = h[m.end():]
+    h = h.split("/")[0].split("?")[0]
+    if h.startswith("["):
+        h = h[1:].split("]")[0]
+    elif h.count(":") == 1:
+        h = h.split(":")[0]
+    return h or "8.8.8.8"
+
+
+def _is_ip(addr: str) -> bool:
+    for fam in (socket.AF_INET, socket.AF_INET6):
+        try:
+            socket.inet_pton(fam, addr)
+            return True
+        except OSError:
+            pass
+    return False
+
+
+def _local_mac() -> bytes:
+    if IS_NIX and os.path.isdir("/sys/class/net"):
+        try:
+            for name in sorted(os.listdir("/sys/class/net")):
+                if name == "lo":
+                    continue
+                with open(f"/sys/class/net/{name}/address") as f:
+                    mac = f.read().strip()
+                if mac and mac != "00:00:00:00:00:00":
+                    return bytes(int(x, 16) for x in mac.split(":"))
+        except Exception:
+            pass
+    import uuid
+    return int(uuid.getnode()).to_bytes(6, "big")
+
+
+def _run_parallel(fns, timeout=6.0):
+    """Run probe callables concurrently — results come back in input order."""
+    results = [None] * len(fns)
+
+    def wrap(i, fn):
+        try:
+            results[i] = fn()
+        except Exception as e:
+            results[i] = e
+
+    threads = [threading.Thread(target=wrap, args=(i, f), daemon=True)
+               for i, f in enumerate(fns)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout)
+    return results
+
+
+# -- Application layer -------------------------------------------------------
+def proto_http(host, emit, stop):
+    """HTTP / HTTPS — request timing breakdown + TLS certificate inspection."""
+    url = host if re.match(r"^https?://", host or "", re.I) else f"https://{host}"
+    emit(f"  HTTP request timing — GET {url}", "title")
+    r = http_probe(url)
+    if r.get("error") and url.startswith("https://"):
+        emit(f"  https failed ({r['error']}), retrying plain http", "warn")
+        r = http_probe(url.replace("https://", "http://", 1))
+    if r.get("error"):
+        emit(f"  ✖ {r['error']}", "err")
+        return ("FAIL", r["error"][:60])
+    emit(f"  DNS resolve   : {r.get('dns_ms', 0):8.1f} ms", "head")
+    emit(f"  TCP connect   : {r.get('tcp_ms', 0):8.1f} ms", "head")
+    if r.get("tls_ms") is not None:
+        emit(f"  TLS handshake : {r.get('tls_ms'):8.1f} ms", "head")
+    emit(f"  TTFB          : {r.get('ttfb_ms', 0):8.1f} ms", "head")
+    emit(f"  Total         : {r.get('total_ms', 0):8.1f} ms", "ok")
+    emit(f"  Status        : {r.get('status', '-')}   Server: {r.get('server', '-')}   "
+         f"Via: {r.get('via', '-')}", "head")
+    status = r.get("status")
+    if url.startswith("https://") and r.get("host"):
+        try:
+            emit("  TLS certificate:", "title")
+            ctx = ssl.create_default_context()
+            with socket.create_connection((r["host"], r.get("port") or 443), 5) as sock:
+                with ctx.wrap_socket(sock, server_hostname=r["host"]) as ssock:
+                    cert = ssock.getpeercert()
+                    emit(f"  protocol {ssock.version()}  cipher "
+                         f"{ssock.cipher()[0] if ssock.cipher() else '-'}", "head")
+            subj = dict(x[0] for x in cert.get("subject", ()))
+            iss = dict(x[0] for x in cert.get("issuer", ()))
+            emit(f"  subject CN : {subj.get('commonName', '-')}", "head")
+            emit(f"  issuer     : {iss.get('organizationName', '-')} "
+                 f"{iss.get('commonName', '')}", "head")
+            na = cert.get("notAfter", "")
+            try:
+                exp = datetime.datetime.strptime(na, "%b %d %H:%M:%S %Y %Z")
+                days = (exp - datetime.datetime.utcnow()).days
+                emit(f"  expires    : {na}  ({days} days left)",
+                     "ok" if days > 14 else "warn")
+            except Exception:
+                emit(f"  expires    : {na}", "head")
+        except Exception as e:
+            emit(f"  certificate inspection failed: {e}", "warn")
+    if status and status < 400:
+        return ("PASS", f"HTTP {status} in {r.get('total_ms', 0):.0f} ms")
+    return ("WARN", f"HTTP {status or '-'} in {r.get('total_ms', 0):.0f} ms")
+
+
+def proto_dns(host, emit, stop):
+    """DNS — system resolver + A/AAAA/MX/NS/TXT/SOA over UDP/53."""
+    name = _short_host(host)
+    emit(f"  DNS protocol test — {name}", "title")
+    ok = 0
+    try:
+        addrs, ms = dns_resolve(name)
+        emit(f"  system resolver : {', '.join(addrs[:4])}  ({ms:.1f} ms)", "ok")
+        ok += 1
+    except Exception as e:
+        emit(f"  system resolver : FAILED — {e}", "err")
+    if _is_ip(name):                       # reverse lookup for IP targets
+        try:
+            ptr, ms = reverse_dns(name)
+            emit(f"  PTR {name} -> {ptr}  ({ms:.1f} ms)", "ok")
+            ok += 1
+        except Exception as e:
+            emit(f"  PTR lookup failed: {e}", "warn")
+        return ("PASS" if ok else "FAIL", f"{ok}/2 lookups answered")
+    qtypes = [(1, "A"), (28, "AAAA"), (15, "MX"), (2, "NS"), (16, "TXT"), (6, "SOA")]
+    for server in ("1.1.1.1", "8.8.8.8"):
+        server_ok = False
+        for qt, qn in qtypes:
+            if stop is not None and stop.is_set():
+                break
+            try:
+                ms, pkt = dns_query(server, name, qt, timeout=2.5)
+                ans = [a[3] for a in pkt.get("answers", []) if a[1] == qt][:3]
+                rc = {0: "", 3: "  [NXDOMAIN]"}.get(pkt.get("rcode"),
+                                                    f"  [rcode {pkt.get('rcode')}]")
+                emit(f"  {qn:5s} via {server:10s}: {ms:6.1f} ms  "
+                     f"{', '.join(ans) if ans else '(no answer)'}{rc}",
+                     "ok" if ans else "head")
+                server_ok = True
+                if ans:
+                    ok += 1
+            except Exception as e:
+                emit(f"  {qn:5s} via {server:10s}: {e}", "err")
+                break                       # resolver unreachable — skip it
+        if not server_ok:
+            continue
+    total = 2 + len(qtypes)
+    return ("PASS" if ok >= 2 else ("WARN" if ok else "FAIL"),
+            f"{ok}/{total} lookups answered")
+
+
+def proto_dhcp(host, emit, stop):
+    """DHCP — broadcast DHCPDISCOVER on UDP 67/68, wait for an OFFER."""
+    import struct
+    import random
+    emit("  DHCP test — broadcast DHCPDISCOVER (UDP 67 → 68)", "title")
+    mac = _local_mac()
+    xid = random.randint(0, 0xFFFFFFFF)
+    pkt = struct.pack("!BBBBIHH", 1, 1, 6, 0, xid, 0, 0x8000)
+    pkt += b"\x00" * 16                       # ciaddr yiaddr siaddr giaddr
+    pkt += mac + b"\x00" * 10                 # chaddr (16)
+    pkt += b"\x00" * (64 + 128)               # sname + file
+    pkt += struct.pack("!I", 0x63825363)      # magic cookie
+    pkt += bytes([53, 1, 1])                  # option 53: DHCPDISCOVER
+    pkt += bytes([55, 4, 1, 3, 6, 15])        # param request: mask, router, dns, domain
+    pkt += bytes([255])                       # end
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    ephemeral = False
+    try:
+        s.bind(("", 68))
+    except Exception:
+        ephemeral = True
+        try:
+            s.bind(("", 0))
+        except Exception:
+            pass
+    s.settimeout(3.5)
+    emit(f"  chaddr {mac.hex(':')}  xid 0x{xid:08x}  source port "
+         f"{'ephemeral' if ephemeral else 68}", "head")
+    try:
+        s.sendto(pkt, ("255.255.255.255", 67))
+        emit("  DISCOVER sent to 255.255.255.255:67", "head")
+    except Exception as e:
+        s.close()
+        emit(f"  ✖ broadcast send failed: {e}", "err")
+        return ("FAIL", f"send failed: {e}")
+    if ephemeral:
+        emit("  note: UDP/68 needs admin/root to bind — replies cannot be seen", "warn")
+    offer = None
+    t_end = time.time() + 3.5
+    while time.time() < t_end and not (stop and stop.is_set()):
+        try:
+            data, addr = s.recvfrom(4096)
+        except socket.timeout:
+            break
+        except Exception:
+            break
+        if len(data) < 240 or data[236:240] != b"\x63\x82\x53\x63":
+            continue
+        mtype = None
+        server_id = ""
+        yiaddr = socket.inet_ntoa(data[16:20]) if len(data) >= 20 else ""
+        i = 240
+        while i + 1 < len(data):
+            code = data[i]
+            if code == 255:
+                break
+            if code == 0:
+                i += 1
+                continue
+            ln = data[i + 1]
+            val = data[i + 2:i + 2 + ln]
+            if code == 53 and val:
+                mtype = val[0]
+            elif code == 54 and len(val) >= 4:
+                server_id = socket.inet_ntoa(val[:4])
+            i += 2 + ln
+        names = {2: "OFFER", 5: "ACK", 6: "NAK"}
+        emit(f"  reply from {addr[0]}: DHCP{names.get(mtype, mtype)}  "
+             f"yiaddr {yiaddr}  server {server_id or '-'}",
+             "ok" if mtype in (2, 5) else "warn")
+        if mtype == 2:
+            offer = (yiaddr, server_id)
+            break
+    s.close()
+    if offer:
+        return ("PASS", f"DHCP OFFER {offer[0]} from {offer[1] or 'server'}")
+    if ephemeral:
+        return ("WARN", "DISCOVER sent — needs admin rights to read the OFFER")
+    return ("WARN", "no OFFER received (server may filter broadcast)")
+
+
+def proto_ftp(host, emit, stop):
+    """FTP / SFTP — FTP control-channel banner + AUTH TLS, SFTP via SSH banner."""
+    h = _short_host(host)
+    emit(f"  FTP / SFTP service probes — {h}", "title")
+
+    def ftp_probe():
+        s = socket.create_connection((h, 21), 4)
+        s.settimeout(4)
+        banner = s.recv(512).decode("utf-8", "replace").strip().splitlines()[0]
+        auth = ""
+        try:
+            s.sendall(b"AUTH TLS\r\n")
+            auth = s.recv(512).decode("utf-8", "replace").strip().splitlines()[0]
+        except Exception:
+            auth = "(no reply)"
+        try:
+            s.sendall(b"QUIT\r\n")
+        except Exception:
+            pass
+        s.close()
+        return banner, auth
+
+    def sftp_probe():
+        s = socket.create_connection((h, 22), 4)
+        s.settimeout(4)
+        banner = s.recv(512).decode("utf-8", "replace").strip().splitlines()[0]
+        s.close()
+        return banner
+
+    banner, auth = None, None
+    (r1, r2) = _run_parallel([ftp_probe, sftp_probe], timeout=5.0)
+    ok = 0
+    if isinstance(r1, tuple):
+        banner, auth = r1
+        good = banner.startswith("220")
+        emit(f"  FTP/21 banner : {banner}", "ok" if good else "warn")
+        emit(f"  AUTH TLS      : {auth}",
+             "ok" if auth.startswith("234") else "info")
+        ok += 1 if good else 0
+    else:
+        emit(f"  FTP/21        : {r1}", "err")
+    if isinstance(r2, str):
+        good = r2.startswith("SSH-")
+        emit(f"  SFTP/22 banner: {r2}", "ok" if good else "warn")
+        emit("  SFTP runs over the SSH transport — banner proves availability",
+             "info")
+        ok += 1 if good else 0
+    else:
+        emit(f"  SFTP/22       : {r2}", "err")
+    return ("PASS" if ok == 2 else ("WARN" if ok else "FAIL"),
+            f"{ok}/2 services answered")
+
+
+def proto_mail(host, emit, stop):
+    """SMTP / POP3 / IMAP — greeting banners on plain and implicit-TLS ports."""
+    h = _short_host(host)
+    emit(f"  Mail service probes — {h}", "title")
+    services = [
+        ("SMTP", 25, False, "220"),
+        ("SMTP submission", 587, False, "220"),
+        ("SMTPS", 465, True, "220"),
+        ("POP3", 110, False, "+OK"),
+        ("POP3S", 995, True, "+OK"),
+        ("IMAP", 143, False, "* OK"),
+        ("IMAPS", 993, True, "* OK"),
+    ]
+
+    def probe(name, port, tls, expect):
+        s = socket.create_connection((h, port), 3.5)
+        try:
+            if tls:
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                s = ctx.wrap_socket(s, server_hostname=h)
+            s.settimeout(3.5)
+            banner = s.recv(512).decode("utf-8", "replace").strip().splitlines()[0]
+            try:
+                s.sendall(b"QUIT\r\n")
+            except Exception:
+                pass
+            return banner, banner.startswith(expect)
+        finally:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+    fns = [lambda s=srv: probe(*s) for srv in services]
+    results = _run_parallel(fns, timeout=5.0)
+    ok = 0
+    for (name, port, tls, expect), res in zip(services, results):
+        if isinstance(res, tuple):
+            banner, good = res
+            emit(f"  {name:16s} {port:4d}{'/tls' if tls else '    '}: {banner[:66]}",
+                 "ok" if good else "warn")
+            ok += 1 if good else 0
+        else:
+            emit(f"  {name:16s} {port:4d}{'/tls' if tls else '    '}: "
+                 f"{str(res)[:60]}", "info")
+    if ok:
+        return ("PASS", f"{ok}/{len(services)} mail services answered")
+    return ("FAIL", "no mail service answered")
+
+
+def proto_ssh(host, emit, stop):
+    """SSH — identification string exchange (RFC 4253 §4.2)."""
+    h = _short_host(host)
+    emit(f"  SSH handshake — {h}:22", "title")
+    try:
+        t0 = time.perf_counter()
+        s = socket.create_connection((h, 22), 5)
+        s.settimeout(5)
+        banner = s.recv(512).decode("utf-8", "replace").strip().splitlines()[0]
+        ms = (time.perf_counter() - t0) * 1000.0
+        emit(f"  identification string: {banner}",
+             "ok" if banner.startswith("SSH-") else "warn")
+        emit(f"  connect + banner      : {ms:.1f} ms", "head")
+        try:
+            s.sendall(b"SSH-2.0-NetProbe_1.3\r\n")
+            kex = s.recv(1024)
+            if kex and kex[0] == 20:
+                emit(f"  KEXINIT received ({len(kex)} bytes) — key exchange can start",
+                     "ok")
+            elif kex:
+                emit(f"  reply {len(kex)} bytes (msg type {kex[0]})", "head")
+        except Exception as e:
+            emit(f"  KEXINIT: {e}", "warn")
+        s.close()
+        if banner.startswith("SSH-"):
+            return ("PASS", banner[:48])
+        return ("WARN", f"non-SSH banner: {banner[:40]}")
+    except Exception as e:
+        emit(f"  ✖ {e}", "err")
+        return ("FAIL", str(e)[:60])
+
+
+# -- SNMP (BER encoding by hand) --------------------------------------------
+def _ber_len(n: int) -> bytes:
+    if n < 0x80:
+        return bytes([n])
+    b = n.to_bytes((n.bit_length() + 7) // 8 or 1, "big")
+    return bytes([0x80 | len(b)]) + b
+
+
+def _ber_int(v: int) -> bytes:
+    b = v.to_bytes((v.bit_length() + 8) // 8 or 1, "big", signed=True)
+    return b"\x02" + _ber_len(len(b)) + b
+
+
+def _ber_oid(parts) -> bytes:
+    out = bytes([40 * parts[0] + parts[1]])
+    for p in parts[2:]:
+        stack = [p & 0x7F]
+        p >>= 7
+        while p:
+            stack.append(0x80 | (p & 0x7F))
+            p >>= 7
+        out += bytes(reversed(stack))
+    return b"\x06" + _ber_len(len(out)) + out
+
+
+def _snmp_get(community: str, oid_parts, req_id: int = 1) -> bytes:
+    varbind = _ber_oid(oid_parts) + b"\x05\x00"            # OID + NULL
+    vbl = b"\x30" + _ber_len(len(varbind)) + varbind       # VarBindList
+    pdu_body = _ber_int(req_id) + b"\x02\x01\x00\x02\x01\x00" + vbl
+    pdu = b"\xa0" + _ber_len(len(pdu_body)) + pdu_body     # GetRequest-PDU
+    comm = b"\x04" + _ber_len(len(community)) + community.encode()
+    body = b"\x02\x01\x01" + comm + pdu                    # version=1 → SNMPv2c
+    return b"\x30" + _ber_len(len(body)) + body
+
+
+def _snmp_strings(data: bytes):
+    """Pull printable OCTET STRINGs out of a BER response (good enough for us)."""
+    out, i = [], 0
+    while i < len(data) - 2:
+        if data[i] == 0x04 and data[i + 1] < 0x80:
+            ln = data[i + 1]
+            if i + 2 + ln <= len(data):
+                s = data[i + 2:i + 2 + ln]
+                if ln >= 2 and all(32 <= c < 127 for c in s):
+                    out.append(s.decode("ascii"))
+                i += 2 + ln
+                continue
+        i += 1
+    return out
+
+
+def proto_snmp(host, emit, stop):
+    """SNMP — SNMPv2c GetRequest for sysDescr.0 / sysName.0 (community public)."""
+    emit("  SNMPv2c GetRequest — UDP/161, community 'public'", "title")
+    targets = []
+    gw, _ = default_gateway()
+    if gw:
+        targets.append((gw, "default gateway"))
+    h = _short_host(host)
+    if _is_ip(h) and h not in targets:
+        targets.append((h, "target host"))
+    if not targets:
+        emit("  no SNMP-capable target identified", "warn")
+        return ("WARN", "no target")
+    oids = [((1, 3, 6, 1, 2, 1, 1, 1, 0), "sysDescr.0"),
+            ((1, 3, 6, 1, 2, 1, 1, 5, 0), "sysName.0")]
+    for tgt, role in targets:
+        emit(f"  target {tgt} ({role})", "head")
+        answered = False
+        for j, (oid, name) in enumerate(oids):
+            if stop is not None and stop.is_set():
+                break
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(3.0)
+            try:
+                s.sendto(_snmp_get("public", oid, j + 1), (tgt, 161))
+                data, addr = s.recvfrom(4096)
+                strs = _snmp_strings(data)
+                val = strs[0] if strs else f"{len(data)}-byte response"
+                emit(f"    {name:10s} = {val[:70]}", "ok")
+                answered = True
+            except Exception as e:
+                emit(f"    {name:10s} — {e}", "warn")
+            finally:
+                s.close()
+        if answered:
+            return ("PASS", f"SNMP answered at {tgt}")
+    return ("WARN", "no SNMP response (filtered or community differs)")
+
+
+# -- Transport layer ---------------------------------------------------------
+def proto_tcp(host, emit, stop):
+    """TCP — handshake timing against the target's service ports."""
+    h = _short_host(host)
+    emit(f"  TCP handshake timing — {h}", "title")
+    any_ok = False
+    for port, samples in ((443, 3), (80, 2)):
+        vals = []
+        for _ in range(samples):
+            if stop is not None and stop.is_set():
+                break
+            try:
+                vals.append(tcp_latency(h, port, 2.5))
+            except Exception:
+                pass
+        if vals:
+            emit(f"  :{port:<5d} {len(vals)}/{samples} handshakes  "
+                 f"avg {sum(vals) / len(vals):6.1f} ms  min {min(vals):.1f}  "
+                 f"max {max(vals):.1f}  jitter {max(vals) - min(vals):.1f} ms", "ok")
+            any_ok = True
+        else:
+            emit(f"  :{port:<5d} handshake failed (filtered or no listener)", "warn")
+    return ("PASS" if any_ok else "FAIL",
+           "handshake OK" if any_ok else "no port accepted a handshake")
+
+
+def proto_udp(host, emit, stop):
+    """UDP — real round-trip via DNS, plus reachability semantics on the target."""
+    h = _short_host(host)
+    emit("  UDP datagram test — connectionless: replies prove reachability,", "title")
+    emit("  silence means open-or-filtered, ICMP unreachable means closed.", "info")
+    ok = 0
+    # 1) proven UDP service: DNS round trip
+    for resolver in ("1.1.1.1", "8.8.8.8"):
+        if stop is not None and stop.is_set():
+            break
+        try:
+            ms, _pkt = dns_query(resolver, "example.com", 1, timeout=2.5)
+            emit(f"  DNS/53 via {resolver:10s}: reply in {ms:6.1f} ms  (UDP RTT proven)",
+                 "ok")
+            ok += 1
+            break
+        except Exception as e:
+            emit(f"  DNS/53 via {resolver:10s}: {e}", "warn")
+    # 2) target reachability semantics
+    for port in (443, 80):
+            if stop is not None and stop.is_set():
+                break
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.settimeout(2.5)
+                t0 = time.perf_counter()
+                s.sendto(b"netprobe-udp-probe\x00" * 2, (h, port))
+                try:
+                    data, addr = s.recvfrom(512)
+                    ms = (time.perf_counter() - t0) * 1000.0
+                    emit(f"  :{port}/udp  reply from {addr[0]} in {ms:.1f} ms "
+                         f"({len(data)} bytes)", "ok")
+                    ok += 1
+                except socket.timeout:
+                    emit(f"  :{port}/udp  no reply — open or filtered (UDP is "
+                         f"connectionless)", "head")
+                except (ConnectionRefusedError, ConnectionResetError):
+                    emit(f"  :{port}/udp  ICMP port unreachable — port closed", "warn")
+                s.close()
+            except Exception as e:
+                emit(f"  :{port}/udp  {e}", "err")
+    return ("PASS" if ok else "WARN", f"{ok} UDP exchange(s) proven")
+
+
+def proto_quic(host, emit, stop):
+    """QUIC — Version Negotiation probe on UDP/443 (RFC 9000 §6)."""
+    import struct
+    import random
+    h = _short_host(host)
+    emit(f"  QUIC Version Negotiation probe — {h}:443/udp", "title")
+    emit("  sending an Initial-style long header with a reserved version; a QUIC",
+         "info")
+    emit("  endpoint must answer with a Version Negotiation packet.", "info")
+    try:
+        addrs, _ms = dns_resolve(h)
+        ip = next((a for a in addrs if ":" not in a), addrs[0])
+    except Exception as e:
+        emit(f"  ✖ resolve failed: {e}", "err")
+        return ("FAIL", f"DNS: {e}")
+    ver = b"\x0a\x0a\x0a\x0a"                 # reserved version (greasing)
+    dcid = bytes(random.getrandbits(8) for _ in range(8))
+    scid = bytes(random.getrandbits(8) for _ in range(8))
+    pkt = (bytes([0xCF]) + ver + bytes([len(dcid)]) + dcid
+           + bytes([len(scid)]) + scid)
+    pkt += b"\x00" * max(0, 1200 - len(pkt))  # pad to a full-size datagram
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(4.0)
+    try:
+        s.sendto(pkt, (ip, 443))
+        data, addr = s.recvfrom(1500)
+    except socket.timeout:
+        s.close()
+        emit("  no reply on UDP/443 — filtered, or the service is not QUIC", "warn")
+        return ("WARN", "no Version Negotiation reply")
+    except Exception as e:
+        s.close()
+        emit(f"  ✖ {e}", "err")
+        return ("FAIL", str(e)[:60])
+    s.close()
+    if not (data[0] & 0x80) or len(data) < 7:
+        emit(f"  unexpected {len(data)}-byte reply (not a long-header packet)", "warn")
+        return ("WARN", "unexpected reply")
+    version = data[1:5].hex()
+    if version != "00000000":
+        emit(f"  reply with version 0x{version} — endpoint speaks this version",
+             "ok")
+        return ("PASS", f"QUIC endpoint (version 0x{version})")
+    # Version Negotiation: parse offered versions
+    off = 5
+    dcid_len = data[off]
+    off += 1 + dcid_len
+    scid_len = data[off] if off < len(data) else 0
+    off += 1 + scid_len
+    versions = []
+    while off + 4 <= len(data):
+        versions.append(data[off:off + 4].hex())
+        off += 4
+    known = {"00000001": "QUIC v1 (RFC 9000)", "6b3343cf": "QUIC v2 (RFC 9369)",
+             "ff00001d": "draft-29", "51303530": "Google QUIC Q050",
+             "51303436": "Google QUIC Q046"}
+    emit(f"  Version Negotiation received from {addr[0]} — {len(versions)} version(s)",
+         "ok")
+    for v in versions[:8]:
+        emit(f"    0x{v}  {known.get(v, '')}", "head")
+    return ("PASS", f"QUIC confirmed — {len(versions)} versions offered")
+
+
+# -- Network / Internet layer ------------------------------------------------
+def proto_ip(host, emit, stop):
+    """IPv4 / IPv6 — dual-stack resolution, local addresses, IPv6 reachability."""
+    h = _short_host(host)
+    emit(f"  IP layer test — {h}", "title")
+    v4, v6 = [], []
+    try:
+        addrs, ms = dns_resolve(h)
+        for a in addrs:
+            (v6 if ":" in a else v4).append(a)
+        emit(f"  resolved: IPv4 {', '.join(v4) or '-'}   IPv6 {', '.join(v6) or '-'}  "
+             f"({ms:.1f} ms)", "ok" if (v4 or v6) else "err")
+    except Exception as e:
+        emit(f"  ✖ resolution failed: {e}", "err")
+    try:
+        local = []
+        for fam, _ty, _pr, _cn, sa in socket.getaddrinfo(socket.gethostname(), None):
+            if sa[0] not in local:
+                local.append(sa[0])
+        emit(f"  local addresses: {', '.join(local[:6]) or '-'}", "head")
+    except Exception as e:
+        emit(f"  local addresses: {e}", "warn")
+    v6_ok = False
+    try:
+        ms = tcp_latency("2606:4700:4700::1111", 443, 3.0)   # Cloudflare DNS over v6
+        emit(f"  IPv6 internet  : reachable (2606:4700:4700::1111 in {ms:.1f} ms)",
+             "ok")
+        v6_ok = True
+    except Exception:
+        emit("  IPv6 internet  : not reachable from this host (IPv4-only or filtered)",
+             "warn")
+    if v4 or v6:
+        return ("PASS" if v6_ok else "WARN",
+                f"IPv4 {len(v4)} / IPv6 {len(v6)} address(es)" +
+                (" + v6 internet" if v6_ok else ""))
+    return ("FAIL", "target did not resolve")
+
+
+def proto_icmp(host, emit, stop):
+    """ICMP — echo request/reply statistics (via the system ping)."""
+    h = _short_host(host)
+    emit(f"  ICMP echo test — {h} (3 pings)", "title")
+    vals, misses = [], 0
+    for i in range(3):
+        if stop is not None and stop.is_set():
+            break
+        ms = icmp_ping_once(h)
+        if ms is None:
+            misses += 1
+            emit(f"  seq {i + 1}: timeout / unreachable", "warn")
+        else:
+            vals.append(ms)
+            emit(f"  seq {i + 1}: echo reply in {ms:6.1f} ms", "ok")
+    if vals:
+        emit(f"  summary: sent 3, received {len(vals)}, "
+             f"loss {100.0 * misses / 3:.0f}%, avg {sum(vals) / len(vals):.1f} ms, "
+             f"jitter {max(vals) - min(vals):.1f} ms", "head")
+        return ("PASS", f"avg {sum(vals) / len(vals):.1f} ms, "
+                        f"loss {100.0 * misses / 3:.0f}%")
+    return ("FAIL", "no echo replies (ICMP may be blocked)")
+
+
+def proto_ospf(host, emit, stop):
+    """OSPF — passive check: scan the routing table for OSPF-learned routes."""
+    emit("  OSPF check — link-state IGP: IP protocol 89, multicast 224.0.0.5/224.0.0.6",
+         "title")
+    emit("  (speaking OSPF needs raw sockets — this is a passive routing-table scan)",
+         "info")
+    found = []
+    try:
+        r = subprocess.run(cmd_routes(), capture_output=True, text=True, timeout=15,
+                           **{k: v for k, v in popen_kwargs().items()
+                              if k == "creationflags"})
+        for line in (r.stdout or "").splitlines():
+            if re.search(r"\bospf\b|\bzebra\b|\bbird\b|proto 89|proto 110", line, re.I):
+                found.append(line.strip())
+                emit(f"    {line.strip()}", "ok")
+    except Exception as e:
+        emit(f"  routing table scan failed: {e}", "warn")
+    gw, _iface = default_gateway()
+    emit(f"  default gateway: {gw or '?'} — OSPF adjacencies live on routers, "
+         f"edge hosts only see their routes", "head")
+    if found:
+        return ("PASS", f"{len(found)} OSPF-learned route(s) visible")
+    return ("INFO", "no OSPF-learned routes visible (normal for an edge host)")
+
+
+def proto_bgp(host, emit, stop):
+    """BGP — TCP/179 liveness + origin ASN of the target."""
+    h = _short_host(host)
+    emit(f"  BGP check — {h} (TCP/179 + ASN origin)", "title")
+    emit("  BGP runs between routers (TCP/179); an edge host shows only its ASN",
+         "info")
+    asn = ""
+    try:
+        info = ip_info(h)
+        if info.get("error"):
+            emit(f"  ASN lookup: {info['error']}", "warn")
+        else:
+            asn = info.get("as", "")
+            emit(f"  target {info.get('ip')}  origin ASN: {asn or '-'}", "ok")
+            emit(f"  ISP {info.get('isp', '-')}   org {info.get('org', '-')}", "head")
+    except Exception as e:
+        emit(f"  ASN lookup failed: {e}", "warn")
+    open_179 = False
+    if _is_ip(h):
+        try:
+            ms = tcp_latency(h, 179, 3.0)
+            emit(f"  TCP/179 to {h}: open — likely a BGP speaker ({ms:.1f} ms)", "ok")
+            open_179 = True
+        except Exception:
+            emit(f"  TCP/179 to {h}: filtered/closed (expected for non-routers)", "head")
+    if open_179:
+        return ("PASS", "TCP/179 open — BGP speaker detected")
+    if asn:
+        return ("WARN", f"{asn} — no direct BGP session (normal on edge hosts)")
+    return ("FAIL", "no ASN data and no BGP port")
+
+
+# -- Data link layer ---------------------------------------------------------
+def proto_arp(host, emit, stop):
+    """ARP — neighbour cache inspection + gateway MAC resolution."""
+    emit("  ARP / neighbour cache", "title")
+    table = arp_entries()
+    if not table:
+        emit("  cache is empty — ping or contact a host on the LAN to populate it",
+             "warn")
+        return ("WARN", "ARP cache empty")
+    gw, _iface = default_gateway()
+    for ip, (mac, iface) in sorted(table.items()):
+        mark = "  ← default gateway" if ip == gw else ""
+        emit(f"    {ip:16s} {mac:20s} {iface}{mark}", "ok" if ip == gw else "head")
+    if gw and gw not in table:
+        emit(f"  gateway {gw} not in cache — trying a quick ping to populate it", "info")
+        icmp_ping_once(gw)
+        table = arp_entries()
+        if gw in table:
+            emit(f"  gateway {gw} -> {table[gw][0]}", "ok")
+    return ("PASS", f"{len(table)} neighbours" +
+                    (f", gateway {table[gw][0]}" if gw in table else ""))
+
+
+def proto_eth(host, emit, stop):
+    """Ethernet — link state, MTU, speed/duplex and error counters per NIC."""
+    emit("  Ethernet link state — per interface", "title")
+    ifaces = iface_counters() or {}
+    errors = iface_errors()
+    up_count = 0
+    for name in sorted(ifaces.keys()):
+        if name == "lo" or name.startswith("lo"):
+            continue
+        bits = [name]
+        if IS_NIX and os.path.isdir(f"/sys/class/net/{name}"):
+            for f, lbl in (("operstate", ""), ("mtu", "mtu"), ("speed", "speed"),
+                           ("duplex", "duplex")):
+                try:
+                    with open(f"/sys/class/net/{name}/{f}") as fh:
+                        val = fh.read().strip()
+                    if val and val != "-1":
+                        bits.append(f"{lbl} {val}" if lbl else val)
+                except Exception:
+                    pass
+        else:
+            bits.append(f"mtu ?")
+        errs = errors.get(name)
+        if errs and any(errs):
+            bits.append(f"errors {errs[0]}/{errs[1]} drops {errs[2]}/{errs[3]}")
+        line = "   ".join(bits)
+        is_up = "down" not in line
+        up_count += 1 if is_up else 0
+        emit(f"    {line}", "ok" if is_up and not (errs and any(errs)) else "warn")
+    if HAVE_PSUTIL:
+        try:
+            st = psutil.net_if_stats()
+            for name, s in sorted(st.items()):
+                if name in ifaces and name not in ("lo",):
+                    emit(f"    {name}: link {'up' if s.isup else 'down'}  "
+                         f"{s.speed or '?'} Mb/s  mtu {s.mtu}",
+                         "ok" if s.isup else "warn")
+        except Exception:
+            pass
+    if not ifaces:
+        emit("  no interface counters available (install psutil for richer data)",
+             "warn")
+        return ("WARN", "no interface data")
+    return ("PASS" if up_count else "WARN", f"{up_count} interface(s) up")
+
+
+def proto_wifi(host, emit, stop):
+    """Wi-Fi (IEEE 802.11) — adapter status, SSID and signal via the OS."""
+    emit("  Wi-Fi / IEEE 802.11 — adapter status via the operating system", "title")
+    cmd = cmd_wifi()
+    if not shutil_which(cmd[0]):
+        emit(f"  '{cmd[0]}' not available on this system — cannot query the adapter",
+             "warn")
+        return ("WARN", f"needs '{cmd[0]}'")
+    try:
+        r = subprocess.run(cmd_wifi(), capture_output=True, text=True, timeout=15,
+                           **{k: v for k, v in popen_kwargs().items()
+                              if k == "creationflags"})
+        out = (r.stdout or "").strip()
+        if not out:
+            emit("  no Wi-Fi information returned (no adapter or missing tools)", "warn")
+            return ("WARN", "no Wi-Fi adapter found")
+        lines = out.splitlines()[:18]
+        for ln in lines:
+            emit("    " + ln[:100], "head")
+        wifi_hit = bool(re.search(r"ssid|signal|signal|channel|wlan|wi-fi|wifi|802\.11",
+                                  out, re.I))
+        return ("PASS" if wifi_hit else "WARN",
+                "Wi-Fi adapter reported" if wifi_hit else "adapter present, no Wi-Fi data")
+    except Exception as e:
+        emit(f"  ✖ {e}", "err")
+        return ("FAIL", str(e)[:60])
+
+
+PROTOCOL_TESTS = {
+    "http": proto_http, "dns": proto_dns, "dhcp": proto_dhcp, "ftp": proto_ftp,
+    "mail": proto_mail, "ssh": proto_ssh, "snmp": proto_snmp,
+    "tcp": proto_tcp, "udp": proto_udp, "quic": proto_quic,
+    "ip": proto_ip, "icmp": proto_icmp, "ospf": proto_ospf, "bgp": proto_bgp,
+    "arp": proto_arp, "eth": proto_eth, "wifi": proto_wifi,
+}
+
+
+# ----------------------------------------------------------------------------
 # UI widgets
 # ----------------------------------------------------------------------------
 class TerminalView(ttk.Frame):
@@ -2540,6 +3368,285 @@ class PingGraphPanel(ttk.Frame):
 
 
 # ----------------------------------------------------------------------------
+# Protocol Lab panel
+# ----------------------------------------------------------------------------
+class ProtocolPanel(ttk.Frame):
+    """Structured protocol tests grouped by OSI layer, with live results."""
+
+    LAYERS = [
+        ("Layer 7 · Application", [
+            ("http", "HTTP / HTTPS", "80 / 443"),
+            ("dns", "DNS", "53 udp+tcp"),
+            ("dhcp", "DHCP", "67 / 68 udp"),
+            ("ftp", "FTP / SFTP", "21 / 22"),
+            ("mail", "SMTP / POP3 / IMAP", "25/110/143 + TLS"),
+            ("ssh", "SSH", "22"),
+            ("snmp", "SNMP", "161 udp"),
+        ]),
+        ("Layer 4 · Transport", [
+            ("tcp", "TCP", "handshake"),
+            ("udp", "UDP", "datagram"),
+            ("quic", "QUIC", "443 udp"),
+        ]),
+        ("Layer 3 · Network / Internet", [
+            ("ip", "IPv4 / IPv6", "dual-stack"),
+            ("icmp", "ICMP", "echo"),
+            ("ospf", "OSPF", "IP proto 89"),
+            ("bgp", "BGP", "tcp 179"),
+        ]),
+        ("Layer 2 · Data Link", [
+            ("arp", "ARP", "neighbour cache"),
+            ("eth", "Ethernet", "link state"),
+            ("wifi", "Wi-Fi (802.11)", "signal"),
+        ]),
+    ]
+    TESTS = PROTOCOL_TESTS
+
+    def __init__(self, master, app):
+        super().__init__(master)
+        self.app = app
+        self.running = False
+        self.stop_ev = threading.Event()
+        self.results = {}          # key -> [(tag, line)]
+        self.status = {}           # key -> (status, summary)
+        self._spin_i = 0
+        self._build()
+        self.after(140, self._spin)
+
+    # -- layout -------------------------------------------------------------
+    def _build(self):
+        top = tk.Frame(self, bg=C["bg"])
+        top.pack(fill="x", pady=(0, 4))
+        for label, fn, col in (("▶ Run Selected", self.run_selected, C["accent"]),
+                               ("Run Layer", self.run_layer, C["panel2"]),
+                               ("Run All (17)", self.run_all, C["panel2"]),
+                               ("■ Stop", self.stop, C["err"]),
+                               ("Clear", self.clear, C["panel2"]),
+                               ("Export", self.export, C["panel2"])):
+            b = tk.Button(top, text=label, command=fn, bg=col,
+                          fg=C["bg"] if col in (C["accent"], C["err"]) else C["fg"],
+                          activebackground=C["border"], activeforeground=C["fg"],
+                          relief="flat", font=UI_FONT, cursor="hand2", padx=10)
+            b.pack(side="left", padx=3)
+            attach_hover(b, col, C["bg"] if col in (C["accent"], C["err"]) else C["fg"])
+        tk.Label(top, text="select a row for full output · target host comes from the "
+                           "top bar",
+                 bg=C["bg"], fg=C["dim"], font=UI_FONT).pack(side="right", padx=8)
+
+        body = tk.Frame(self, bg=C["bg"])
+        body.pack(fill="both", expand=True)
+
+        left = tk.Frame(body, bg=C["bg"])
+        left.pack(side="left", fill="both", expand=True, padx=(0, 6))
+        self.tree = ttk.Treeview(left, columns=("endpoint", "status", "summary"),
+                                 selectmode="browse", height=16)
+        self.tree.heading("#0", text="OSI layer / protocol")
+        self.tree.heading("endpoint", text="endpoint")
+        self.tree.heading("status", text="status")
+        self.tree.heading("summary", text="result")
+        self.tree.column("#0", width=230, stretch=True)
+        self.tree.column("endpoint", width=110, anchor="center", stretch=False)
+        self.tree.column("status", width=80, anchor="center", stretch=False)
+        self.tree.column("summary", width=230, stretch=True)
+        ys = ttk.Scrollbar(left, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=ys.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        ys.pack(side="left", fill="y")
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+
+        right = tk.Frame(body, bg=C["bg"], width=430)
+        right.pack(side="left", fill="both", expand=True)
+        self.detail = tk.Text(right, wrap="none", bg=C["bg"], fg=C["fg"],
+                              insertbackground=C["fg"], font=MONO, relief="flat",
+                              padx=8, pady=6)
+        ds = ttk.Scrollbar(right, orient="vertical", command=self.detail.yview)
+        self.detail.configure(yscrollcommand=ds.set)
+        self.detail.pack(side="left", fill="both", expand=True)
+        ds.pack(side="left", fill="y")
+        self.detail.tag_configure("cmd", foreground=C["cmd"],
+                                  font=(MONO[0], MONO[1], "bold"))
+        self.detail.tag_configure("ok", foreground=C["ok"])
+        self.detail.tag_configure("warn", foreground=C["warn"])
+        self.detail.tag_configure("err", foreground=C["err"],
+                                  font=(MONO[0], MONO[1], "bold"))
+        self.detail.tag_configure("info", foreground=C["dim"])
+        self.detail.tag_configure("title", foreground=C["accent"],
+                                  font=(MONO[0], MONO[1], "bold"))
+        self.detail.tag_configure("head", foreground=C["head"])
+
+        for li, (layer, items) in enumerate(self.LAYERS):
+            lid = f"layer{li}"
+            self.tree.insert("", "end", iid=lid, text=f"  {layer}", open=True,
+                             values=("", "", f"{len(items)} tests"))
+            for key, label, ep in items:
+                self.tree.insert(lid, "end", iid=f"p:{key}", text=f"    {label}",
+                                 values=(ep, "—", ""))
+                self.status[key] = ("—", "")
+                self.results[key] = []
+
+    # -- animated status ----------------------------------------------------
+    def _spin(self):
+        self._spin_i += 1
+        try:
+            for key, (st, _s) in self.status.items():
+                if st == "running":
+                    self.tree.set(f"p:{key}", "status",
+                                  SPIN_FRAMES[self._spin_i % len(SPIN_FRAMES)])
+        except Exception:
+            pass
+        self.after(140, self._spin)
+
+    # -- run controls -------------------------------------------------------
+    def _keys_of(self, node):
+        return [c[2:] for c in self.tree.get_children(node) if c.startswith("p:")]
+
+    def run_selected(self):
+        sel = self.tree.selection()
+        keys = []
+        for s in sel:
+            keys.extend(self._keys_of(s) if s.startswith("layer") else
+                        ([s[2:]] if s.startswith("p:") else []))
+        if not keys:
+            self.app.status("protocol lab: select a row first")
+            return
+        self._start(keys)
+
+    def run_layer(self):
+        sel = self.tree.selection()
+        if not sel:
+            self.app.status("protocol lab: select a layer or protocol row first")
+            return
+        node = sel[0]
+        if node.startswith("p:"):
+            node = self.tree.parent(node)
+        keys = self._keys_of(node)
+        if keys:
+            self._start(keys)
+
+    def run_layer_index(self, idx):
+        keys = self._keys_of(f"layer{idx}")
+        if keys:
+            self._start(keys)
+
+    def run_all(self):
+        self._start([k for _layer, items in self.LAYERS for k, _lbl, _ep in items])
+
+    def stop(self):
+        self.stop_ev.set()
+        self.app.status("protocol lab: stopping after the current probe…")
+
+    def _start(self, keys):
+        if self.running:
+            self.app.status("protocol lab already running — press ■ Stop first")
+            return
+        self.running = True
+        self.stop_ev.clear()
+        for k in keys:
+            self.status[k] = ("running", "")
+            self.results[k] = []
+            self.tree.set(f"p:{k}", "summary", "")
+        self.app.status(f"protocol lab: running {len(keys)} test(s) against "
+                        f"{self.app.host()}")
+        threading.Thread(target=self._work, args=(keys, self.app.host()),
+                         daemon=True).start()
+
+    def _work(self, keys, host):
+        for k in keys:
+            if self.stop_ev.is_set():
+                break
+            fn = self.TESTS.get(k)
+            if fn is None:
+                continue
+            self.app.queue.put(("proto_start", k))
+
+            def emit(t, tag="head", _k=k):
+                self.app.queue.put(("proto_line", _k, tag, t))
+
+            try:
+                st, summary = fn(host, emit, self.stop_ev)
+            except Exception as e:
+                st, summary = "FAIL", f"error: {e}"
+            self.app.queue.put(("proto_done", k, st, summary))
+        self.app.queue.put(("proto_all_done",))
+
+    # -- results ------------------------------------------------------------
+    def add_line(self, key, tag, text):
+        self.results.setdefault(key, []).append((tag, text))
+        try:
+            sel = self.tree.selection()
+            if sel and sel[0] == f"p:{key}":
+                self.detail.insert("end", text + "\n", tag)
+                self.detail.see("end")
+        except Exception:
+            pass
+
+    def set_status(self, key, st, summary):
+        self.status[key] = (st, summary)
+        try:
+            self.tree.set(f"p:{key}", "status", st)
+            self.tree.set(f"p:{key}", "summary", summary)
+            sel = self.tree.selection()
+            if sel and sel[0] == f"p:{key}":
+                self._on_select()          # keep the detail header in sync
+        except Exception:
+            pass
+
+    def finish(self):
+        self.running = False
+        self.app.status("protocol lab: all requested tests finished")
+
+    def _on_select(self, _evt=None):
+        sel = self.tree.selection()
+        if not sel or not sel[0].startswith("p:"):
+            return
+        key = sel[0][2:]
+        label = self.tree.item(sel[0], "text").strip()
+        st, summary = self.status.get(key, ("—", ""))
+        self.detail.delete("1.0", "end")
+        self.detail.insert("end", f"{label}  —  {st}", "title")
+        if summary:
+            self.detail.insert("end", f"   {summary}", "title")
+        self.detail.insert("end", "\n" + "─" * 60 + "\n", "info")
+        for tag, text in self.results.get(key, []):
+            self.detail.insert("end", text + "\n", tag)
+        if not self.results.get(key):
+            self.detail.insert("end", "  (not run yet — press ▶ Run Selected)", "info")
+        self.detail.see("1.0")
+
+    def clear(self):
+        for key in self.results:
+            self.results[key] = []
+            self.status[key] = ("—", "")
+            try:
+                self.tree.set(f"p:{key}", "status", "—")
+                self.tree.set(f"p:{key}", "summary", "")
+            except Exception:
+                pass
+        self.detail.delete("1.0", "end")
+        self.app.status("protocol lab: results cleared")
+
+    def export(self):
+        path = filedialog.asksaveasfilename(
+            defaultextension=".log",
+            filetypes=[("Log", "*.log"), ("Text", "*.txt"), ("All", "*.*")],
+            initialfile=f"netprobe-protocols-"
+                        f"{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}.log")
+        if not path:
+            return
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"{APP_NAME} v{VERSION} — Protocol Lab\n")
+            f.write(f"target: {self.app.host()}   {datetime.datetime.now()}\n")
+            for layer, items in self.LAYERS:
+                f.write(f"\n== {layer} " + "=" * max(0, 56 - len(layer)) + "\n")
+                for key, label, ep in items:
+                    st, summary = self.status.get(key, ("—", ""))
+                    f.write(f"\n--- {label} ({ep})  [{st}] {summary}\n")
+                    for _tag, text in self.results.get(key, []):
+                        f.write(text + "\n")
+        self.app.status(f"protocol lab: saved {path}")
+
+
+# ----------------------------------------------------------------------------
 # Main application
 # ----------------------------------------------------------------------------
 class App(tk.Tk):
@@ -2720,6 +3827,14 @@ class App(tk.Tk):
         action("DNS Compare         Ctrl+N", self.run_dns_compare)
         action("Top Talkers         Ctrl+J", self.run_top_talkers)
 
+        section("PROTOCOL LAB (OSI)")
+        action("Protocol Lab         Ctrl+Shift+L", self.show_protocol)
+        action("Run ALL protocols    Ctrl+Shift+K", self.run_all_protocols)
+        action("▸ Application layer", lambda: self.run_protocol_layer(0))
+        action("▸ Transport layer", lambda: self.run_protocol_layer(1))
+        action("▸ Network layer", lambda: self.run_protocol_layer(2))
+        action("▸ Data-link layer", lambda: self.run_protocol_layer(3))
+
         section("CUSTOM COMMAND")
         self.custom_var = tk.StringVar(value="netstat -an")
         tk.Entry(side_in, textvariable=self.custom_var, bg=C["panel2"], fg=C["fg"],
@@ -2743,6 +3858,9 @@ class App(tk.Tk):
 
         self.terminals = TerminalsPanel(self.nb, self)
         self.nb.add(self.terminals, text="  Terminals  ")
+
+        self.proto = ProtocolPanel(self.nb, self)
+        self.nb.add(self.proto, text="  Protocol Lab  ")
 
         self.pinggraph = PingGraphPanel(self.nb, self)
         self.nb.add(self.pinggraph, text="  Ping Graph (compare)  ")
@@ -2822,6 +3940,8 @@ class App(tk.Tk):
         b("<Control-E>", lambda e: self.run_error_watch())
         b("<Control-T>", lambda e: self.nb.select(self.terminals))
         b("<Control-N>", lambda e: self.cycle_theme())   # Ctrl+Shift+N: next theme
+        b("<Control-L>", lambda e: self.show_protocol())  # Ctrl+Shift+L: protocol lab
+        b("<Control-K>", lambda e: self.run_all_protocols())
         b("<F5>", lambda e: self.run_selected())
 
     # -- helpers ------------------------------------------------------------
@@ -2932,8 +4052,9 @@ class App(tk.Tk):
     def _spin_tick(self, i=0):
         """Animated busy indicator in the status bar."""
         try:
-            busy = self.monitor_running or any(
-                v._status_text == "running" for v in self.terminals.all_views())
+            busy = (self.monitor_running or getattr(self.proto, "running", False)
+                    or any(v._status_text == "running"
+                           for v in self.terminals.all_views()))
             if busy:
                 self.spin_label.configure(text=SPIN_FRAMES[i % len(SPIN_FRAMES)],
                                           fg=C["accent"])
@@ -2979,6 +4100,8 @@ class App(tk.Tk):
                 (f"  psutil: {'yes' if HAVE_PSUTIL else 'NO (pip install psutil)'}", "info"),
                 ("  Shortcuts: Ctrl+1..9 tests · Ctrl+D full diagnose · Ctrl+M matrix · "
                  "Ctrl+T traffic · Ctrl+S save · F5 run", "info"),
+                ("  Protocol Lab: Ctrl+Shift+L opens it · Ctrl+Shift+K runs all "
+                 "17 protocol tests", "info"),
                 ("  Themes: pick one in the top bar, or Ctrl+Shift+N to cycle", "info"),
                 ("  Select a test on the left, or press a shortcut key.", "warn"),
                 ("─" * 78, "info"),
@@ -3065,6 +4188,18 @@ class App(tk.Tk):
             self.pinggraph.push(label, ts, ms)
         elif kind == "pinggraph_done":
             self.status("ping graph finished")
+        elif kind == "proto_line":
+            _, key, tag, text = item
+            self.proto.add_line(key, tag, text)
+        elif kind == "proto_start":
+            self.proto.set_status(item[1], "running", "")
+        elif kind == "proto_done":
+            _, key, st, summary = item
+            self.proto.set_status(key, st, summary)
+            self.status(f"[protocol] {self.proto.tree.item(f'p:{key}', 'text').strip()}: "
+                        f"{st} — {summary}")
+        elif kind == "proto_all_done":
+            self.proto.finish()
         elif kind == "table":
             for ln in item[1]:
                 self.terminal.write(ln, "head")
@@ -3528,6 +4663,17 @@ class App(tk.Tk):
         threading.Thread(target=work, daemon=True).start()
 
     # -- tabs ---------------------------------------------------------------
+    def show_protocol(self):
+        self.nb.select(self.proto)
+
+    def run_all_protocols(self):
+        self.show_protocol()
+        self.proto.run_all()
+
+    def run_protocol_layer(self, idx):
+        self.show_protocol()
+        self.proto.run_layer_index(idx)
+
     def show_matrix(self):
         self.nb.select(self.matrix)
 
