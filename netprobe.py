@@ -10,7 +10,14 @@ One portable app for Windows / macOS / Linux laptops:
   * Live multi-interface traffic charts (upload / download per NIC)
   * Active connection analyzer (per-process sockets)
   * Multi-host matrix: probe many hosts at once, compare latency/loss
-  * Switchable colour themes (8 palettes: dark, light, high-contrast …)
+  * TLS/SSL lab: per-version handshake matrix (TLS 1.0–1.3), certificate
+    chain inspection, trust/hostname validation, expiry warnings
+  * Extra quick tests: WHOIS, NTP clock offset, IPv6 readiness, HTTP
+    security headers, well-known service-port availability
+  * Switchable colour themes (8 palettes) + a live colour editor for
+    text/background and every other role (saved as the 'Custom' theme)
+  * Fully responsive layout: resizable panes, wrapping toolbars, tree
+    columns that follow the window width — nothing is clipped on resize
   * Animated UI: typewriter intro, hover effects, spinners, progress bars
 
 No installation needed beyond Python 3.8+.
@@ -41,7 +48,7 @@ from urllib.parse import urlparse
 
 try:
     import tkinter as tk
-    from tkinter import ttk, filedialog, messagebox
+    from tkinter import ttk, filedialog, messagebox, colorchooser
     HAVE_TK = True
 except Exception:  # headless build or python3-tk missing → CLI still works
     HAVE_TK = False
@@ -61,16 +68,17 @@ except Exception:  # headless build or python3-tk missing → CLI still works
             return lambda *a, **k: None
 
     tk = _NS()
-    for _n in ("Tk", "Text", "Canvas", "Listbox", "Entry", "Label", "Frame",
-               "Button", "Scrollbar", "StringVar", "BooleanVar", "IntVar"):
+    for _n in ("Tk", "Toplevel", "Text", "Canvas", "Listbox", "Entry", "Label",
+               "Frame", "Button", "Scrollbar", "StringVar", "BooleanVar", "IntVar"):
         setattr(tk, _n, _mk(_n))
     tk.TclError = type("TclError", (Exception,), {})
     ttk = _NS()
     for _n in ("Frame", "Label", "Button", "Scrollbar", "Notebook", "Treeview",
-               "Style", "Labelframe"):
+               "Style", "Labelframe", "PanedWindow"):
         setattr(ttk, _n, _mk(_n))
     filedialog = _NS()
     messagebox = _NS()
+    colorchooser = _NS()
 
 try:
     import psutil  # optional
@@ -80,7 +88,7 @@ except Exception:
     HAVE_PSUTIL = False
 
 APP_NAME = "NetProbe"
-VERSION = "1.3"
+VERSION = "1.4"
 IS_WIN = platform.system() == "Windows"
 IS_MAC = platform.system() == "Darwin"
 IS_NIX = not IS_WIN and not IS_MAC
@@ -218,21 +226,57 @@ def _theme_config_path():
         return "netprobe_theme.json"
 
 
-def load_theme_name():
+def _read_theme_config() -> dict:
     try:
         with open(_theme_config_path(), "r", encoding="utf-8") as f:
-            name = json.load(f).get("theme", "")
-        return name if name in THEMES else DEFAULT_THEME
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
     except Exception:
-        return DEFAULT_THEME
+        return {}
+
+
+def _write_theme_config(data: dict):
+    try:
+        with open(_theme_config_path(), "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=1)
+    except Exception:
+        pass
+
+
+def load_theme_name():
+    name = _read_theme_config().get("theme", "")
+    return name if name in THEMES else DEFAULT_THEME
 
 
 def save_theme_name(name):
-    try:
-        with open(_theme_config_path(), "w", encoding="utf-8") as f:
-            json.dump({"theme": name}, f)
-    except Exception:
-        pass
+    data = _read_theme_config()
+    data["theme"] = name
+    _write_theme_config(data)
+
+
+def load_custom_colors() -> dict:
+    """User-edited palette saved by the colour editor ("Custom" theme)."""
+    pal = _read_theme_config().get("custom", {})
+    if not isinstance(pal, dict):
+        return {}
+    return {k: v for k, v in pal.items()
+            if k in C and isinstance(v, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", v)}
+
+
+def save_custom_colors(colors: dict):
+    data = _read_theme_config()
+    data["custom"] = dict(colors)
+    _write_theme_config(data)
+
+
+def register_custom_theme(colors: dict):
+    """Install the user palette as the 'Custom' theme entry."""
+    pal = dict(C)
+    pal.update(colors)
+    THEMES["Custom"] = pal
+    if "Custom" not in THEME_NAMES:
+        THEME_NAMES.append("Custom")
+    return pal
 
 
 def attach_hover(widget, base_bg, base_fg=None, lift=0.16):
@@ -2372,9 +2416,543 @@ def proto_wifi(host, emit, stop):
         return ("FAIL", str(e)[:60])
 
 
+# ----------------------------------------------------------------------------
+# TLS / SSL inspection
+# ----------------------------------------------------------------------------
+# Every probe has signature fn(host, port, emit, ...) where emit(line, tag)
+# writes one output line (tags: head/ok/warn/err/info/title).
+
+def _tls_version_matrix():
+    """(label, ssl.TLSVersion) for every protocol level worth probing."""
+    V = getattr(ssl, "TLSVersion", None)
+    if V is None:                                  # pragma: no cover - py<3.7
+        return []
+    return [
+        ("TLS 1.3", getattr(V, "TLSv1_3", None)),
+        ("TLS 1.2", getattr(V, "TLSv1_2", None)),
+        ("TLS 1.1", getattr(V, "TLSv1_1", None)),
+        ("TLS 1.0", getattr(V, "TLSv1", None)),
+        ("SSL 3.0", getattr(V, "SSLv3", None)),
+    ]
+
+
+def tls_probe_version(host: str, port: int, ver, timeout: float = 5.0) -> dict:
+    """One handshake pinned to a single TLS/SSL version."""
+    out = {"ok": False, "cipher": "", "error": "", "ms": None}
+    if ver is None:
+        out["error"] = "not available in this Python/OpenSSL build"
+        return out
+    t0 = time.perf_counter()
+    try:
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            ctx.minimum_version = ver
+            ctx.maximum_version = ver
+    except Exception as e:
+        out["error"] = f"disabled locally: {e}"
+        return out
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as raw:
+            with ctx.wrap_socket(raw, server_hostname=host) as ss:
+                out["ok"] = True
+                out["cipher"] = (ss.cipher() or ("?",))[0]
+                out["ms"] = (time.perf_counter() - t0) * 1000.0
+    except Exception as e:
+        out["error"] = str(e)[:110]
+        out["ms"] = (time.perf_counter() - t0) * 1000.0
+    return out
+
+
+def tls_versions_report(host: str, port: int, emit, stop=None):
+    """Probe every TLS/SSL version — shows exactly what the server accepts."""
+    emit(f"  TLS/SSL version matrix — {host}:{port}", "title")
+    emit("  one handshake per protocol version (client offers only that version)",
+         "info")
+    supported, deprecated = [], []
+    for label, ver in _tls_version_matrix():
+        if stop is not None and stop.is_set():
+            break
+        r = tls_probe_version(host, port, ver)
+        if r["ok"]:
+            supported.append(label)
+            tag = "ok" if label in ("TLS 1.3", "TLS 1.2") else "warn"
+            if label not in ("TLS 1.3", "TLS 1.2"):
+                deprecated.append(label)
+            emit(f"  ✔ {label:8s} supported   cipher {r['cipher']}   "
+                 f"handshake {r['ms']:.0f} ms", tag)
+        else:
+            emit(f"  ✖ {label:8s} {r['error']}", "info")
+    if not supported:
+        emit("  no TLS version negotiated — service may not speak TLS on this port",
+             "err")
+    elif deprecated:
+        emit(f"  ⚠ deprecated protocol(s) enabled: {', '.join(deprecated)} — "
+             f"consider disabling them on the server", "warn")
+    return supported, deprecated
+
+
+def _decode_der_cert(der: bytes) -> dict:
+    """Best-effort decode of a DER certificate → the ssl cert dict."""
+    import tempfile
+    try:
+        pem = ssl.DER_cert_to_PEM_cert(der)
+        with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False,
+                                         encoding="ascii") as f:
+            f.write(pem)
+            path = f.name
+        try:
+            return ssl._ssl._test_decode_cert(path) or {}   # noqa: SLF001
+        finally:
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
+    except Exception:
+        return {}
+
+
+def _cert_fingerprint(der: bytes) -> str:
+    import hashlib
+    return ":".join(hashlib.sha256(der).hexdigest()[i:i + 2].upper()
+                    for i in range(0, 32, 2))
+
+
+def _tls_chain(host: str, port: int, timeout: float = 6.0) -> list:
+    """Leaf-first list of DER certificates.  Tries the stdlib chain API
+    (Python 3.13+), then `openssl s_client -showcerts`, then the leaf only."""
+    leaf = None
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        with socket.create_connection((host, port), timeout=timeout) as raw:
+            with ctx.wrap_socket(raw, server_hostname=host) as ss:
+                getter = getattr(ss, "get_unverified_chain", None) or \
+                         getattr(ss, "getpeercertchain", None)
+                if getter:
+                    out = []
+                    for item in getter():
+                        if isinstance(item, bytes):
+                            out.append(item)
+                        elif hasattr(item, "public_bytes"):
+                            try:
+                                import cryptography.hazmat.primitives.serialization as _ser
+                                out.append(item.public_bytes(_ser.Encoding.DER))
+                            except Exception:
+                                pass
+                    if out:
+                        return out
+                leaf = ss.getpeercert(True)
+    except Exception:
+        pass
+    exe = shutil_which("openssl")
+    if exe:
+        try:
+            r = subprocess.run(
+                [exe, "s_client", "-showcerts", "-connect", f"{host}:{port}",
+                 "-servername", host],
+                input=b"", capture_output=True, timeout=timeout + 4)
+            text = (r.stdout or b"").decode("utf-8", "replace")
+            pems = re.findall(
+                r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+                text, re.S)
+            if pems:
+                return [ssl.PEM_cert_to_DER_cert(p) for p in pems]
+        except Exception:
+            pass
+    return [leaf] if leaf else []
+
+
+def tls_certificate_report(host: str, port: int, emit, stop=None):
+    """Certificate chain + leaf details + trust/hostname validation."""
+    emit(f"  TLS certificate report — {host}:{port}", "title")
+
+    # 1) verified handshake (system trust store) → does the chain validate?
+    verified, verify_msg = False, ""
+    try:
+        vctx = ssl.create_default_context()
+        with socket.create_connection((host, port), timeout=6.0) as raw:
+            with vctx.wrap_socket(raw, server_hostname=host) as ss:
+                verified = True
+                verify_msg = (ss.version() or "") + " " + ((ss.cipher() or ("",))[0])
+        emit("  ✔ certificate chain validates against the system trust store", "ok")
+    except Exception as e:
+        verify_msg = str(e)[:140]
+        emit(f"  ✖ trust validation failed: {verify_msg}", "err")
+
+    # 2) unverified handshake → leaf details even when untrusted
+    #    (getpeercert() is empty under CERT_NONE, so decode the DER leaf)
+    cert, proto, cipher, alpn = {}, "", "", ""
+    der_leaf = None
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        try:
+            ctx.set_alpn_protocols(["h2", "http/1.1"])
+        except Exception:
+            pass
+        with socket.create_connection((host, port), timeout=6.0) as raw:
+            with ctx.wrap_socket(raw, server_hostname=host) as ss:
+                der_leaf = ss.getpeercert(True)
+                proto = ss.version() or ""
+                cipher = (ss.cipher() or ("?",))[0]
+                alpn = ss.selected_alpn_protocol() or ""
+    except Exception as e:
+        emit(f"  ✖ handshake failed: {e}", "err")
+        return False, "handshake failed"
+    if der_leaf:
+        cert = _decode_der_cert(der_leaf)
+
+    emit(f"  negotiated : {proto} · {cipher}" +
+         (f" · ALPN {alpn}" if alpn else ""), "head")
+
+    subj = dict(x[0] for x in cert.get("subject", ()))
+    iss = dict(x[0] for x in cert.get("issuer", ()))
+    emit(f"  subject    : CN={subj.get('commonName', '?')}"
+         + (f"  O={subj['organizationName']}" if subj.get("organizationName") else ""),
+         "head")
+    emit(f"  issuer     : CN={iss.get('commonName', '?')}"
+         + (f"  O={iss['organizationName']}" if iss.get("organizationName") else ""),
+         "head")
+    nb, na = cert.get("notBefore", ""), cert.get("notAfter", "")
+    days_left = None
+    try:
+        days_left = (ssl.cert_time_to_seconds(na) - time.time()) / 86400.0
+    except Exception:
+        pass
+    emit(f"  validity   : {nb}  →  {na}", "head")
+    if days_left is not None:
+        if days_left < 0:
+            emit(f"  ✖ EXPIRED {abs(days_left):.0f} days ago", "err")
+        elif days_left < 14:
+            emit(f"  ⚠ expires in {days_left:.0f} days — renew now", "warn")
+        elif days_left < 30:
+            emit(f"  ⚠ expires in {days_left:.0f} days", "warn")
+        else:
+            emit(f"  ✔ expires in {days_left:.0f} days", "ok")
+    if cert.get("serialNumber"):
+        emit(f"  serial     : {cert['serialNumber']}", "info")
+    sans = [v for k, v in cert.get("subjectAltName", ()) if k in ("DNS", "IP Address")]
+    if sans:
+        emit(f"  SANs       : {', '.join(sans[:12])}"
+             + (f"  (+{len(sans) - 12} more)" if len(sans) > 12 else ""), "head")
+    for key, label in (("OCSP", "OCSP"), ("caIssuers", "CA issuer"),
+                       ("crlDistributionPoints", "CRL")):
+        vals = cert.get(key) or []
+        if vals:
+            emit(f"  {label:10s}: {', '.join(str(v) for v in vals[:3])}", "info")
+
+    # 3) chain of trust (leaf → intermediates → root)
+    chain = _tls_chain(host, port)
+    if not chain:
+        emit("  (chain listing unavailable — needs Python 3.13+ or the openssl CLI)",
+             "info")
+    else:
+        emit(f"  chain      : {len(chain)} certificate(s), leaf first", "title")
+        for i, der in enumerate(chain):
+            info = _decode_der_cert(der)
+            s = dict(x[0] for x in info.get("subject", ())) if info else {}
+            issr = dict(x[0] for x in info.get("issuer", ())) if info else {}
+            role = "leaf" if i == 0 else ("root" if s and s == issr else f"intermediate {i}")
+            name = (s.get("commonName") or ("?" if info else "(undecoded)"))
+            expire = info.get("notAfter", "") if info else ""
+            emit(f"    [{i}] {role:14s} CN={name}", "head")
+            emit(f"        issuer CN={issr.get('commonName', '?')}   expires {expire}",
+                 "info")
+            emit(f"        sha256 {_cert_fingerprint(der)[:47]}…  ({len(der)} B)",
+                 "info")
+
+    if verified:
+        return True, f"{proto} verified"
+    return False, verify_msg[:60]
+
+
+def tls_audit(host: str, port: int, emit, stop=None) -> tuple:
+    """Full TLS audit: versions + certificate chain + verification."""
+    supported, deprecated = tls_versions_report(host, port, emit, stop)
+    emit("", "info")
+    verified, vmsg = tls_certificate_report(host, port, emit, stop)
+    if not supported:
+        return ("FAIL", "no TLS on this port")
+    if not verified or deprecated:
+        bits = []
+        if deprecated:
+            bits.append("old TLS: " + ", ".join(deprecated))
+        if not verified:
+            bits.append("unverified chain")
+        return ("WARN", "; ".join(bits)[:80])
+    return ("PASS", f"{'/'.join(supported)} · verified")
+
+
+# ----------------------------------------------------------------------------
+# Quick network helpers (WHOIS / NTP / IPv6 / headers / service ports)
+# ----------------------------------------------------------------------------
+def whois_lookup(query: str, emit, timeout: float = 8.0, max_hops: int = 3):
+    """WHOIS via whois.iana.org on port 43, following referrals."""
+    q = query.strip()
+    if "://" in q:
+        q = _short_host(q)
+    else:
+        q = q.split(":")[0] if _is_ip(q.split(":")[0]) else q
+    server, seen = "whois.iana.org", set()
+    emit(f"  WHOIS lookup — {q}", "title")
+    for _hop in range(max_hops):
+        if not server or server in seen:
+            break
+        seen.add(server)
+        emit(f"  ── {server}:43", "info")
+        try:
+            s = socket.create_connection((server, 43), timeout=timeout)
+            try:
+                payload = (q + "\r\n").encode("idna") if q.isascii() else \
+                          (q + "\r\n").encode("utf-8", "replace")
+            except Exception:
+                payload = (q + "\r\n").encode("utf-8", "replace")
+            s.sendall(payload)
+            chunks = []
+            s.settimeout(timeout)
+            while True:
+                try:
+                    b = s.recv(4096)
+                except socket.timeout:
+                    break
+                if not b:
+                    break
+                chunks.append(b)
+                if sum(len(c) for c in chunks) > 262144:
+                    break
+            s.close()
+        except Exception as e:
+            emit(f"  ✖ {server}: {e}", "err")
+            return
+        text = b"".join(chunks).decode("utf-8", "replace")
+        lines = [ln for ln in text.splitlines() if ln.strip()]
+        for ln in lines[:40]:
+            emit("    " + ln[:110], "head")
+        if len(lines) > 40:
+            emit(f"    … ({len(lines) - 40} more lines)", "info")
+        nxt = None
+        for ln in lines:
+            m = re.match(r"^(?:refer|registrar whois server|whois server|referralserver)"
+                         r":\s*(\S+)", ln, re.I)
+            if m:
+                cand = m.group(1).strip().strip("/")
+                cand = re.sub(r"^(?:rwhois|whois)://", "", cand, flags=re.I)
+                cand = cand.split("/")[0].split(":")[0]
+                if cand and cand.lower() not in ("whois.iana.org",):
+                    nxt = cand
+                    break
+        if not nxt:
+            break
+        server = nxt
+    emit("  WHOIS lookup finished", "ok")
+
+
+def ntp_check(emit, server: str = "pool.ntp.org", timeout: float = 4.0):
+    """NTP v4 client query over UDP 123 → stratum / offset / delay."""
+    emit(f"  NTP time check — {server}:123 (udp)", "title")
+    pkt = bytearray(48)
+    pkt[0] = 0b00100011        # LI=0, VN=4, Mode=3 (client)
+    t1 = time.time()
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(timeout)
+    try:
+        s.sendto(bytes(pkt), (server, 123))
+        data, addr = s.recvfrom(512)
+    except Exception as e:
+        emit(f"  ✖ no NTP reply: {e}", "err")
+        s.close()
+        return
+    s.close()
+    t4 = time.time()
+    if len(data) < 48:
+        emit("  ✖ short NTP reply", "err")
+        return
+    e = 2208988800          # 1900 → 1970 epoch shift
+
+    def ts(off):
+        sec = int.from_bytes(data[off:off + 4], "big") - e
+        frac = int.from_bytes(data[off + 4:off + 8], "big") / 2 ** 32
+        return sec + frac
+    stratum = data[1]
+    t2, t3 = ts(32), ts(40)
+    delay = (t4 - t1) - (t3 - t2)
+    offset = ((t2 - t1) + (t3 - t4)) / 2.0
+    emit(f"  server   : {addr[0]}   stratum {stratum}   "
+         f"{['kiss-o-death', 'primary', 'secondary'][min(stratum, 2)]}-like", "head")
+    emit(f"  delay    : {delay * 1000:.1f} ms", "head")
+    emit(f"  offset   : {offset * 1000:+.1f} ms  (local clock vs NTP server)",
+         "ok" if abs(offset) < 0.5 else "warn")
+    if abs(offset) > 5:
+        emit("  ⚠ clock is significantly off — consider enabling time sync", "warn")
+
+
+def ipv6_check(host: str, emit, timeout: float = 5.0):
+    """IPv6 readiness: AAAA resolution + TCP connect over v6 + global v6 reachability."""
+    emit(f"  IPv6 check — {host}", "title")
+    try:
+        infos = socket.getaddrinfo(host, None, socket.AF_INET6, socket.SOCK_STREAM)
+        addrs = []
+        for i in infos:
+            a = i[4][0].split("%")[0]
+            if a not in addrs:
+                addrs.append(a)
+        emit(f"  AAAA records: {', '.join(addrs[:6])}", "ok" if addrs else "warn")
+    except Exception as e:
+        addrs = []
+        emit(f"  ✖ no AAAA records: {e}", "warn")
+    for a in addrs[:2]:
+        try:
+            t0 = time.perf_counter()
+            s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            s.connect((a, 443))
+            s.close()
+            emit(f"  ✔ TCP6 [{a}]:443 in {(time.perf_counter() - t0) * 1000:.0f} ms",
+                 "ok")
+        except Exception as e:
+            emit(f"  ✖ TCP6 [{a}]:443 {e}", "warn")
+    emit("  global v6 reachability (2606:4700:4700::1111:443):", "info")
+    try:
+        t0 = time.perf_counter()
+        s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect(("2606:4700:4700::1111", 443))
+        s.close()
+        emit(f"  ✔ IPv6 internet OK in {(time.perf_counter() - t0) * 1000:.0f} ms",
+             "ok")
+    except Exception as e:
+        emit(f"  ✖ IPv6 internet unreachable: {e}", "warn")
+
+
+def http_headers_report(target: str, emit, timeout: float = 10.0):
+    """Response headers + redirect chain + security-header checklist."""
+    url = target if re.match(r"^https?://", target, re.I) else f"https://{_short_host(target)}"
+    emit(f"  HTTP headers — {url}", "title")
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": f"{APP_NAME}/{VERSION}"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            status = getattr(r, "status", 200)
+            final = r.geturl()
+            hdrs = dict(r.headers.items())
+        emit(f"  status     : {status}   final URL: {final}", "ok")
+    except urllib.error.HTTPError as e:
+        status, final, hdrs = e.code, e.geturl(), dict(e.headers.items())
+        emit(f"  status     : {status}   final URL: {final}", "warn")
+    except Exception as e:
+        emit(f"  ✖ request failed: {e}", "err")
+        return
+    for k in sorted(hdrs):
+        emit(f"    {k}: {hdrs[k][:100]}", "head")
+    checks = {
+        "strict-transport-security": "HSTS — forces HTTPS",
+        "content-security-policy": "CSP — XSS mitigation",
+        "x-content-type-options": "MIME sniffing protection",
+        "x-frame-options": "clickjacking protection",
+        "referrer-policy": "referrer leakage control",
+    }
+    low = {k.lower() for k in hdrs}
+    for key, why in checks.items():
+        if key in low:
+            emit(f"  ✔ {key}", "ok")
+        else:
+            emit(f"  ✖ {key} missing — {why}", "warn")
+
+
+COMMON_SERVICE_PORTS = [
+    (21, "FTP"), (22, "SSH"), (25, "SMTP"), (53, "DNS"), (80, "HTTP"),
+    (110, "POP3"), (143, "IMAP"), (443, "HTTPS"), (445, "SMB"), (465, "SMTPS"),
+    (993, "IMAPS"), (995, "POP3S"), (3306, "MySQL"), (3389, "RDP"),
+    (5432, "PostgreSQL"), (8080, "HTTP-alt"), (8443, "HTTPS-alt"),
+]
+
+
+def common_ports_check(host: str, emit, stop=None, timeout: float = 1.2):
+    """Fixed well-known service-port availability check on one host.
+
+    This is a bounded connectivity test against a curated service list
+    (not a sweep): it reports open/closed per standard service port.
+    """
+    emit(f"  well-known service ports — {host} ({len(COMMON_SERVICE_PORTS)} services)",
+         "title")
+    emit("  fixed service list · TCP connect · report-only", "info")
+    results = [None] * len(COMMON_SERVICE_PORTS)
+
+    def one(i, port, name):
+        if stop is not None and stop.is_set():
+            return
+        t0 = time.perf_counter()
+        try:
+            s = socket.create_connection((host, port), timeout=timeout)
+            ms = (time.perf_counter() - t0) * 1000.0
+            banner = ""
+            try:
+                s.settimeout(0.8)
+                if port in (80, 8080, 8443, 443):
+                    pass
+                else:
+                    b = s.recv(96)
+                    banner = (b or b"").decode("utf-8", "replace").strip().splitlines()
+                    banner = banner[0][:48] if banner else ""
+            except Exception:
+                pass
+            s.close()
+            results[i] = ("OPEN", port, name, ms, banner)
+        except Exception:
+            results[i] = ("closed", port, name, None, "")
+
+    threads = [threading.Thread(target=one, args=(i, p, n), daemon=True)
+               for i, (p, n) in enumerate(COMMON_SERVICE_PORTS)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout + 2.0)
+    n_open = 0
+    for r in results:
+        if r is None:
+            continue
+        state, port, name, ms, banner = r
+        if state == "OPEN":
+            n_open += 1
+            emit(f"  ✔ {port:<5}/tcp  {name:<12} open   {ms:6.1f} ms  "
+                 + (f"banner: {banner}" if banner else ""), "ok")
+        else:
+            emit(f"  · {port:<5}/tcp  {name:<12} closed/filtered", "info")
+    emit(f"  summary: {n_open}/{len(COMMON_SERVICE_PORTS)} well-known ports open",
+         "ok" if n_open else "warn")
+    return n_open
+
+
+def proto_tls(host, emit, stop):
+    """TLS / SSL — versions, certificate chain and trust validation."""
+    port = 443
+    if host.count(":") == 1 and host.rsplit(":", 1)[1].isdigit():
+        host, port = host.rsplit(":", 1)
+        port = int(port)
+    return tls_audit(host, port, emit, stop)
+
+
+def proto_whois(host, emit, stop):
+    """WHOIS — registration / allocation record lookup."""
+    whois_lookup(host, emit)
+    return ("INFO", "whois queried")
+
+
+def proto_ntp(host, emit, stop):
+    """NTP — time service reachability and clock offset."""
+    ntp_check(emit)
+    return ("INFO", "ntp queried")
+
+
 PROTOCOL_TESTS = {
     "http": proto_http, "dns": proto_dns, "dhcp": proto_dhcp, "ftp": proto_ftp,
-    "mail": proto_mail, "ssh": proto_ssh, "snmp": proto_snmp,
+    "mail": proto_mail, "ssh": proto_ssh, "snmp": proto_snmp, "tls": proto_tls,
+    "whois": proto_whois, "ntp": proto_ntp,
     "tcp": proto_tcp, "udp": proto_udp, "quic": proto_quic,
     "ip": proto_ip, "icmp": proto_icmp, "ospf": proto_ospf, "bgp": proto_bgp,
     "arp": proto_arp, "eth": proto_eth, "wifi": proto_wifi,
@@ -2384,6 +2962,108 @@ PROTOCOL_TESTS = {
 # ----------------------------------------------------------------------------
 # UI widgets
 # ----------------------------------------------------------------------------
+class FlowFrame(tk.Frame):
+    """Toolbar whose children wrap into rows as the window resizes.
+
+    Every control stays fully visible at any window size: children are laid out
+    with grid inside rows that re-flow whenever the frame gets wider/narrower.
+    """
+
+    def __init__(self, master, **kw):
+        super().__init__(master, **kw)
+        self._items = []          # (widget, padx, pady, weight)
+        self._after = None
+        self.bind("<Configure>", self._schedule)
+
+    def add(self, widget, padx=3, pady=4, weight=0):
+        self._items.append((widget, padx, pady, weight))
+        self._reflow()
+
+    def _schedule(self, _evt=None):
+        if self._after is not None:
+            try:
+                self.after_cancel(self._after)
+            except Exception:
+                pass
+        self._after = self.after(120, self._reflow)
+
+    def _reflow(self):
+        self._after = None
+        try:
+            width = max(self.winfo_width(), 160)
+        except Exception:
+            return
+        rows, row_w = [[]], 0
+        for item in self._items:
+            w, padx, _pady, _wt = item
+            try:
+                need = w.winfo_reqwidth() + 2 * padx
+            except Exception:
+                need = 120
+            if rows[-1] and row_w + need > width:
+                rows.append([])
+                row_w = 0
+            rows[-1].append(item)
+            row_w += need
+        for w, _px, _py, _wt in self._items:
+            try:
+                w.grid_forget()
+            except Exception:
+                pass
+        ncol = max((len(r) for r in rows), default=1)
+        for c in range(ncol):
+            try:
+                self.columnconfigure(c, weight=0)
+            except Exception:
+                pass
+        for r, row in enumerate(rows):
+            for c, (w, padx, pady, weight) in enumerate(row):
+                try:
+                    w.grid(row=r, column=c, padx=padx, pady=pady,
+                           sticky="nsew" if weight else "w")
+                    if weight:
+                        self.columnconfigure(c, weight=weight)
+                except Exception:
+                    pass
+
+
+def fit_treeview(tree, plan):
+    """Keep Treeview columns proportional to the widget width so no column
+    text is hidden when the window is resized.
+
+    plan: [(col_id, weight, min_width), ...] — width distributes like the grid.
+    """
+    state = {"after": None}
+
+    def apply(_e=None):
+        try:
+            total = tree.winfo_width()
+        except Exception:
+            return
+        if total <= 1:
+            return
+        usable = max(total - 24, sum(m for _c, _w, m in plan))
+        wsum = sum(max(1, w) for _c, w, _m in plan)
+        for col, w, m in plan:
+            try:
+                tree.column(col, width=max(m, int(usable * w / wsum)),
+                            minwidth=m, stretch=True)
+            except Exception:
+                pass
+
+    def on_conf(evt):
+        if state["after"] is not None:
+            try:
+                tree.after_cancel(state["after"])
+            except Exception:
+                pass
+        state["after"] = tree.after(150, apply)
+
+    tree.bind("<Configure>", on_conf, add="+")
+    tree.after(300, apply)
+    return apply
+
+
 class TerminalView(ttk.Frame):
     """One terminal pane: color-tagged output + its own command line + own process."""
 
@@ -2407,16 +3087,16 @@ class TerminalView(ttk.Frame):
         ys.grid(row=0, column=1, sticky="ns")
         xs.grid(row=1, column=0, sticky="ew")
 
-        bar = tk.Frame(self, bg=C["bg"])
+        bar = FlowFrame(self, bg=C["bg"])
         bar.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
         self.status_var = tk.StringVar(value="idle")
-        tk.Label(bar, textvariable=self.status_var, bg=C["bg"], fg=C["dim"],
-                 font=UI_FONT, width=11, anchor="w").pack(side="left", padx=(0, 6))
+        bar.add(tk.Label(bar, textvariable=self.status_var, bg=C["bg"], fg=C["dim"],
+                         font=UI_FONT, width=11, anchor="w"), padx=(0, 6), pady=2)
         self.entry_var = tk.StringVar()
         ent = tk.Entry(bar, textvariable=self.entry_var, bg=C["panel2"], fg=C["fg"],
                        insertbackground=C["fg"], relief="flat", font=MONO)
-        ent.pack(side="left", fill="x", expand=True, padx=4)
         ent.bind("<Return>", lambda e: self.run_entry())
+        bar.add(ent, padx=4, pady=2, weight=1)
         for label, fn, col in (("▶ Run", self.run_entry, C["accent"]),
                                ("■ Stop", self.stop, C["err"]),
                                ("Clear", self.clear, C["panel2"]),
@@ -2426,7 +3106,7 @@ class TerminalView(ttk.Frame):
                           fg=C["bg"] if col in (C["accent"], C["err"]) else C["fg"],
                           activebackground=C["border"], activeforeground=C["fg"],
                           relief="flat", font=UI_FONT, cursor="hand2", padx=8)
-            b.pack(side="left", padx=2)
+            bar.add(b, padx=2, pady=2)
             attach_hover(b, col, C["bg"] if col in (C["accent"], C["err"]) else C["fg"])
 
         self.rowconfigure(0, weight=1)
@@ -2590,7 +3270,7 @@ class TerminalsPanel(ttk.Frame):
     def __init__(self, master, app):
         super().__init__(master)
         self.app = app
-        top = tk.Frame(self, bg=C["bg"])
+        top = FlowFrame(self, bg=C["bg"])
         top.pack(fill="x", pady=(0, 4))
         for label, fn in (("＋ New Terminal", self.add_terminal),
                           ("✕ Close Terminal", self.close_terminal),
@@ -2598,10 +3278,10 @@ class TerminalsPanel(ttk.Frame):
             b = tk.Button(top, text=label, command=fn, bg=C["panel2"], fg=C["fg"],
                           activebackground=C["accent"], activeforeground=C["bg"],
                           relief="flat", font=UI_FONT, cursor="hand2", padx=10)
-            b.pack(side="left", padx=3)
+            top.add(b, padx=3, pady=2)
             attach_hover(b, C["panel2"], C["fg"])
-        tk.Label(top, text="each tab = one independent output stream + command line",
-                 bg=C["bg"], fg=C["dim"], font=UI_FONT).pack(side="right", padx=8)
+        top.add(tk.Label(top, text="each tab = one independent output stream + command line",
+                         bg=C["bg"], fg=C["dim"], font=UI_FONT), padx=8, pady=2)
 
         self.tabs = ttk.Notebook(self)
         self.tabs.pack(fill="both", expand=True)
@@ -2694,7 +3374,7 @@ class TrafficPanel(ttk.Frame):
             attach_hover(b, C["panel2"], C["fg"])
 
         self.stats = tk.Text(left, width=28, height=10, bg=C["panel2"], fg=C["fg"],
-                             font=MONO, relief="flat", state="disabled",
+                             font=MONO, relief="flat", state="disabled", wrap="word",
                              highlightthickness=1, highlightbackground=C["border"])
         self.stats.pack(fill="both", expand=True, pady=4)
 
@@ -2900,19 +3580,21 @@ class ConnPanel(ttk.Frame):
         self.app = app
         self.paused = False
 
-        bar = ttk.Frame(self)
+        bar = FlowFrame(self)
         bar.pack(fill="x", padx=8, pady=6)
-        ttk.Label(bar, text="Filter:", foreground=C["accent"]).pack(side="left")
+        bar.add(ttk.Label(bar, text="Filter:", foreground=C["accent"]),
+                padx=(2, 2), pady=2)
         self.filter_var = tk.StringVar()
         ent = tk.Entry(bar, textvariable=self.filter_var, bg=C["panel2"], fg=C["fg"],
                        insertbackground=C["fg"], relief="flat", font=UI_FONT, width=28)
-        ent.pack(side="left", padx=6)
         ent.bind("<Return>", lambda e: self.refresh())
+        bar.add(ent, padx=6, pady=2, weight=1)
         for label, fn in (("Refresh", self.refresh), ("Pause/Resume", self.toggle),
                           ("Export CSV", self.export)):
-            tk.Button(bar, text=label, command=fn, bg=C["panel2"], fg=C["fg"],
-                      activebackground=C["accent"], activeforeground=C["bg"],
-                      relief="flat", font=UI_FONT, cursor="hand2").pack(side="left", padx=3)
+            b = tk.Button(bar, text=label, command=fn, bg=C["panel2"], fg=C["fg"],
+                          activebackground=C["accent"], activeforeground=C["bg"],
+                          relief="flat", font=UI_FONT, cursor="hand2")
+            bar.add(b, padx=3, pady=2)
 
         wrap = ttk.Frame(self)
         wrap.pack(fill="both", expand=True, padx=8, pady=4)
@@ -2921,6 +3603,9 @@ class ConnPanel(ttk.Frame):
         for c in self.COLS:
             self.tree.heading(c, text=c.upper(), command=lambda cc=c: self._sort(cc))
             self.tree.column(c, width=widths[c], anchor="w")
+        fit_treeview(self.tree, [("pid", 0.7, 60), ("process", 1.5, 100),
+                                 ("proto", 0.7, 60), ("local", 2.2, 150),
+                                 ("remote", 2.2, 150), ("status", 1.0, 80)])
         ys = ttk.Scrollbar(wrap, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=ys.set)
         self.tree.pack(side="left", fill="both", expand=True)
@@ -3017,11 +3702,14 @@ class MatrixPanel(ttk.Frame):
                              highlightbackground=C["border"])
         self.hosts.pack(fill="x", pady=4)
         self.hosts.insert("end", "1.1.1.1\n8.8.8.8\ngoogle.com\ngithub.com\ncloudflare.com")
+        mrow = FlowFrame(self)
+        mrow.pack(fill="x", padx=8, pady=(0, 2))
         for label, fn in (("Run Matrix", self.run), ("Stop", self.stop),
                           ("Export CSV", self.export)):
-            tk.Button(top, text=label, command=fn, bg=C["panel2"], fg=C["fg"],
-                      activebackground=C["accent"], activeforeground=C["bg"],
-                      relief="flat", font=UI_FONT, cursor="hand2").pack(side="left", padx=3)
+            b = tk.Button(mrow, text=label, command=fn, bg=C["panel2"], fg=C["fg"],
+                          activebackground=C["accent"], activeforeground=C["bg"],
+                          relief="flat", font=UI_FONT, cursor="hand2")
+            mrow.add(b, padx=3, pady=2)
 
         wrap = ttk.Frame(self)
         wrap.pack(fill="both", expand=True, padx=8, pady=4)
@@ -3032,6 +3720,10 @@ class MatrixPanel(ttk.Frame):
         for c in cols:
             self.tree.heading(c, text=c.upper())
             self.tree.column(c, width=widths[c], anchor="w")
+        fit_treeview(self.tree, [("host", 2.0, 130), ("ip", 1.6, 110),
+                                 ("dns_ms", 0.9, 70), ("tcp_min", 0.9, 70),
+                                 ("tcp_avg", 0.9, 70), ("tcp_max", 0.9, 70),
+                                 ("loss", 0.8, 60), ("status", 1.6, 110)])
         self.tree.tag_configure("good", foreground=C["ok"])
         self.tree.tag_configure("bad", foreground=C["err"])
         self.tree.tag_configure("warn", foreground=C["warn"])
@@ -3147,18 +3839,20 @@ class PingGraphPanel(ttk.Frame):
         tk.Entry(top, textvariable=self.hosts_var, bg=C["panel2"], fg=C["fg"],
                  insertbackground=C["fg"], relief="flat", font=MONO).pack(fill="x", pady=3)
 
-        opts = tk.Frame(self, bg=C["bg"])
+        opts = FlowFrame(self, bg=C["bg"])
         opts.pack(fill="x", pady=(0, 4))
-        tk.Label(opts, text="interval(s):", bg=C["bg"], fg=C["dim"], font=UI_FONT).pack(side="left")
+        opts.add(tk.Label(opts, text="interval(s):", bg=C["bg"], fg=C["dim"], font=UI_FONT),
+                 padx=(0, 2), pady=2)
         self.interval_var = tk.StringVar(value="1")
-        tk.Entry(opts, textvariable=self.interval_var, width=5, bg=C["panel2"], fg=C["fg"],
-                 insertbackground=C["fg"], relief="flat", font=MONO).pack(side="left", padx=4)
-        tk.Label(opts, text="duration(s):", bg=C["bg"], fg=C["dim"], font=UI_FONT).pack(side="left")
+        opts.add(tk.Entry(opts, textvariable=self.interval_var, width=5, bg=C["panel2"], fg=C["fg"],
+                 insertbackground=C["fg"], relief="flat", font=MONO), padx=4, pady=2)
+        opts.add(tk.Label(opts, text="duration(s):", bg=C["bg"], fg=C["dim"], font=UI_FONT),
+                 padx=(6, 2), pady=2)
         self.duration_var = tk.StringVar(value="0")
-        tk.Entry(opts, textvariable=self.duration_var, width=6, bg=C["panel2"], fg=C["fg"],
-                 insertbackground=C["fg"], relief="flat", font=MONO).pack(side="left", padx=4)
-        tk.Label(opts, text="(0 = run until stopped)", bg=C["bg"], fg=C["dim"],
-                 font=UI_FONT).pack(side="left", padx=6)
+        opts.add(tk.Entry(opts, textvariable=self.duration_var, width=6, bg=C["panel2"], fg=C["fg"],
+                 insertbackground=C["fg"], relief="flat", font=MONO), padx=4, pady=2)
+        opts.add(tk.Label(opts, text="(0 = run until stopped)", bg=C["bg"], fg=C["dim"],
+                          font=UI_FONT), padx=6, pady=2)
         for label, fn, col in (("▶ Start", self.start, C["accent"]),
                                ("■ Stop", self.stop, C["err"]),
                                ("Reset", self.reset, C["panel2"]),
@@ -3167,7 +3861,7 @@ class PingGraphPanel(ttk.Frame):
                           fg=C["bg"] if col in (C["accent"], C["err"]) else C["fg"],
                           activebackground=C["border"], relief="flat", font=UI_FONT,
                           cursor="hand2", padx=10)
-            b.pack(side="left", padx=3)
+            opts.add(b, padx=3, pady=2)
             attach_hover(b, col, C["bg"] if col in (C["accent"], C["err"]) else C["fg"])
 
         body = tk.Frame(self, bg=C["bg"])
@@ -3176,8 +3870,8 @@ class PingGraphPanel(ttk.Frame):
                                 highlightbackground=C["border"])
         self.canvas.pack(side="left", fill="both", expand=True)
         self.stats = tk.Text(body, width=32, bg=C["panel2"], fg=C["fg"], font=MONO,
-                             relief="flat", state="disabled", highlightthickness=1,
-                             highlightbackground=C["border"])
+                             relief="flat", state="disabled", wrap="word",
+                             highlightthickness=1, highlightbackground=C["border"])
         self.stats.pack(side="right", fill="y", padx=(6, 0))
         self.after(420, self._anim)
 
@@ -3376,12 +4070,15 @@ class ProtocolPanel(ttk.Frame):
     LAYERS = [
         ("Layer 7 · Application", [
             ("http", "HTTP / HTTPS", "80 / 443"),
+            ("tls", "TLS / SSL", "443 · versions + chain"),
             ("dns", "DNS", "53 udp+tcp"),
             ("dhcp", "DHCP", "67 / 68 udp"),
             ("ftp", "FTP / SFTP", "21 / 22"),
             ("mail", "SMTP / POP3 / IMAP", "25/110/143 + TLS"),
             ("ssh", "SSH", "22"),
             ("snmp", "SNMP", "161 udp"),
+            ("whois", "WHOIS", "43 tcp"),
+            ("ntp", "NTP", "123 udp"),
         ]),
         ("Layer 4 · Transport", [
             ("tcp", "TCP", "handshake"),
@@ -3415,11 +4112,11 @@ class ProtocolPanel(ttk.Frame):
 
     # -- layout -------------------------------------------------------------
     def _build(self):
-        top = tk.Frame(self, bg=C["bg"])
+        top = FlowFrame(self, bg=C["bg"])
         top.pack(fill="x", pady=(0, 4))
         for label, fn, col in (("▶ Run Selected", self.run_selected, C["accent"]),
                                ("Run Layer", self.run_layer, C["panel2"]),
-                               ("Run All (17)", self.run_all, C["panel2"]),
+                               (f"Run All ({len(self.TESTS)})", self.run_all, C["panel2"]),
                                ("■ Stop", self.stop, C["err"]),
                                ("Clear", self.clear, C["panel2"]),
                                ("Export", self.export, C["panel2"])):
@@ -3427,11 +4124,11 @@ class ProtocolPanel(ttk.Frame):
                           fg=C["bg"] if col in (C["accent"], C["err"]) else C["fg"],
                           activebackground=C["border"], activeforeground=C["fg"],
                           relief="flat", font=UI_FONT, cursor="hand2", padx=10)
-            b.pack(side="left", padx=3)
+            top.add(b, padx=3, pady=2)
             attach_hover(b, col, C["bg"] if col in (C["accent"], C["err"]) else C["fg"])
-        tk.Label(top, text="select a row for full output · target host comes from the "
+        top.add(tk.Label(top, text="select a row for full output · target host comes from the "
                            "top bar",
-                 bg=C["bg"], fg=C["dim"], font=UI_FONT).pack(side="right", padx=8)
+                         bg=C["bg"], fg=C["dim"], font=UI_FONT), padx=8, pady=2)
 
         body = tk.Frame(self, bg=C["bg"])
         body.pack(fill="both", expand=True)
@@ -3445,9 +4142,12 @@ class ProtocolPanel(ttk.Frame):
         self.tree.heading("status", text="status")
         self.tree.heading("summary", text="result")
         self.tree.column("#0", width=230, stretch=True)
-        self.tree.column("endpoint", width=110, anchor="center", stretch=False)
-        self.tree.column("status", width=80, anchor="center", stretch=False)
+        self.tree.column("endpoint", width=110, anchor="center", stretch=True)
+        self.tree.column("status", width=80, anchor="center", stretch=True)
         self.tree.column("summary", width=230, stretch=True)
+        # columns follow the panel width so no header/text is ever hidden
+        fit_treeview(self.tree, [("#0", 2.2, 140), ("endpoint", 1.1, 80),
+                                 ("status", 0.8, 60), ("summary", 2.2, 130)])
         ys = ttk.Scrollbar(left, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=ys.set)
         self.tree.pack(side="left", fill="both", expand=True)
@@ -3460,9 +4160,11 @@ class ProtocolPanel(ttk.Frame):
                               insertbackground=C["fg"], font=MONO, relief="flat",
                               padx=8, pady=6)
         ds = ttk.Scrollbar(right, orient="vertical", command=self.detail.yview)
-        self.detail.configure(yscrollcommand=ds.set)
+        dx = ttk.Scrollbar(right, orient="horizontal", command=self.detail.xview)
+        self.detail.configure(yscrollcommand=ds.set, xscrollcommand=dx.set)
+        ds.pack(side="right", fill="y")
+        dx.pack(side="bottom", fill="x")
         self.detail.pack(side="left", fill="both", expand=True)
-        ds.pack(side="left", fill="y")
         self.detail.tag_configure("cmd", foreground=C["cmd"],
                                   font=(MONO[0], MONO[1], "bold"))
         self.detail.tag_configure("ok", foreground=C["ok"])
@@ -3647,17 +4349,127 @@ class ProtocolPanel(ttk.Frame):
 
 
 # ----------------------------------------------------------------------------
+# Colour editor — pick text / background (and every role) by hand
+# ----------------------------------------------------------------------------
+class ColorEditor(tk.Toplevel):
+    """Live colour picker for text, background and every other palette role."""
+
+    ROLES = [
+        ("bg", "Window background"),
+        ("panel", "Panel background"),
+        ("panel2", "Panel / input fields"),
+        ("border", "Borders"),
+        ("fg", "Text (primary)"),
+        ("dim", "Text (dim / hints)"),
+        ("accent", "Accent"),
+        ("ok", "Status: OK / success"),
+        ("warn", "Status: warning"),
+        ("err", "Status: error"),
+        ("cmd", "Terminal: command lines"),
+        ("head", "Terminal: output text"),
+        ("rx", "Chart: download / RX"),
+        ("tx", "Chart: upload / TX"),
+    ]
+
+    def __init__(self, master, app):
+        super().__init__(master)
+        self.app = app
+        self.title("Colors — text & background")
+        self.configure(bg=C["bg"])
+        self.transient(master)
+        self.resizable(False, False)
+        self.colors = dict(C)
+        self.swatches = {}
+
+        tk.Label(self, text="Click a swatch to pick a colour — changes apply live.  "
+                            "Save to keep them as the 'Custom' theme.",
+                 bg=C["bg"], fg=C["dim"], font=UI_FONT,
+                 wraplength=420, justify="left").pack(anchor="w", padx=14,
+                                                        pady=(14, 6))
+        grid = tk.Frame(self, bg=C["bg"])
+        grid.pack(padx=14, pady=4)
+        for i, (key, label) in enumerate(self.ROLES):
+            tk.Label(grid, text=label, bg=C["bg"], fg=C["fg"], font=UI_FONT,
+                     anchor="w").grid(row=i, column=0, sticky="w", padx=8, pady=2)
+            sw = tk.Button(grid, text="  " + self.colors.get(key, "#000000") + "  ",
+                           bg=self.colors.get(key), fg=self.colors.get("fg", "#000"),
+                           activebackground=C["accent"], font=MONO, relief="flat",
+                           cursor="hand2", width=20,
+                           command=lambda k=key: self.pick(k))
+            sw.grid(row=i, column=1, padx=8, pady=2)
+            self.swatches[key] = sw
+
+        btns = tk.Frame(self, bg=C["bg"])
+        btns.pack(pady=12)
+        for label, fn, col in (("Save as 'Custom' theme", self.save, C["accent"]),
+                               ("Reset to theme", self.reset, C["panel2"]),
+                               ("Close", self.destroy, C["panel2"])):
+            tk.Button(btns, text=label, command=fn, bg=col,
+                      fg=C["bg"] if col == C["accent"] else C["fg"],
+                      activebackground=C["accent"], activeforeground=C["bg"],
+                      relief="flat", font=UI_FONT, cursor="hand2", padx=12
+                      ).pack(side="left", padx=5)
+        try:
+            self.grab_set()
+        except Exception:
+            pass
+
+    def pick(self, key):
+        try:
+            _rgb, hexv = colorchooser.askcolor(
+                color=self.colors.get(key, "#ffffff"), parent=self,
+                title=f"Choose colour — {key}")
+        except Exception:
+            return
+        if not hexv:
+            return
+        self.colors[key] = hexv
+        self.swatches[key].configure(bg=hexv, text="  " + hexv + "  ")
+        self.apply()
+
+    def apply(self):
+        old = dict(C)
+        C.update(self.colors)
+        try:
+            self.app._restyle(old, dict(C))
+        except Exception:
+            pass
+
+    def reset(self):
+        self.colors = dict(THEMES.get(self.app.theme_name, C))
+        for key, sw in self.swatches.items():
+            sw.configure(bg=self.colors.get(key),
+                         text="  " + self.colors.get(key, "") + "  ")
+        self.apply()
+
+    def save(self):
+        self.apply()
+        register_custom_theme(self.colors)
+        save_custom_colors(self.colors)
+        save_theme_name("Custom")
+        self.app.theme_name = "Custom"
+        try:
+            self.app.theme_var.set("Custom")
+        except Exception:
+            pass
+        self.app.status("custom colour theme saved — text/background/roles updated")
+
+
+# ----------------------------------------------------------------------------
 # Main application
 # ----------------------------------------------------------------------------
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
+        custom = load_custom_colors()
+        if custom:
+            register_custom_theme(custom)
         self.theme_name = load_theme_name()
         if self.theme_name in THEMES:
             C.update(THEMES[self.theme_name])
         self.title(f"{APP_NAME} v{VERSION} — Portable Network Testing & Traffic Analysis")
         self.geometry("1280x820")
-        self.minsize(1024, 680)
+        self.minsize(880, 560)
         self.configure(bg=C["bg"])
         self.queue = queue.Queue()
         self.proc = None
@@ -3700,20 +4512,22 @@ class App(tk.Tk):
 
     # -- layout -------------------------------------------------------------
     def _build_ui(self):
-        # top bar
-        top = tk.Frame(self, bg=C["panel"], highlightthickness=1,
-                       highlightbackground=C["border"])
+        # top bar — FlowFrame wraps rows instead of clipping when the window narrows
+        top = FlowFrame(self, bg=C["panel"], highlightthickness=1,
+                        highlightbackground=C["border"])
         top.pack(fill="x", padx=8, pady=(8, 4))
-        tk.Label(top, text="  Target host:", bg=C["panel"], fg=C["accent"], font=UI_FONT).pack(side="left")
+        lbl = tk.Label(top, text="Target host:", bg=C["panel"], fg=C["accent"], font=UI_FONT)
+        top.add(lbl, padx=(8, 2), pady=6)
         self.host_var = tk.StringVar(value="8.8.8.8")
         self.host_entry = tk.Entry(top, textvariable=self.host_var, width=26,
                                    bg=C["panel2"], fg=C["fg"], insertbackground=C["fg"],
                                    relief="flat", font=MONO)
-        self.host_entry.pack(side="left", padx=6, pady=6)
-        tk.Label(top, text="Count:", bg=C["panel"], fg=C["dim"], font=UI_FONT).pack(side="left")
+        top.add(self.host_entry, padx=4, pady=6, weight=1)
+        cnt = tk.Label(top, text="Count:", bg=C["panel"], fg=C["dim"], font=UI_FONT)
+        top.add(cnt, padx=(6, 2), pady=6)
         self.count_var = tk.StringVar(value="4")
-        tk.Entry(top, textvariable=self.count_var, width=4, bg=C["panel2"], fg=C["fg"],
-                 insertbackground=C["fg"], relief="flat", font=MONO).pack(side="left", padx=4)
+        top.add(tk.Entry(top, textvariable=self.count_var, width=4, bg=C["panel2"], fg=C["fg"],
+                 insertbackground=C["fg"], relief="flat", font=MONO), padx=4, pady=6)
         self.host_entry.bind("<Return>", lambda e: self.run_selected())
 
         for label, fn, col in (("▶ Run (F5)", self.run_selected, C["accent"]),
@@ -3721,11 +4535,12 @@ class App(tk.Tk):
                                ("Clear", self.clear_terminal, C["panel2"]),
                                ("Save Log", self.save_log, C["panel2"]),
                                ("Copy", self.copy_terminal, C["panel2"])):
-            self._btn(top, label, fn, col).pack(side="left", padx=4, pady=6)
+            top.add(self._btn(top, label, fn, col), padx=3, pady=6)
 
         # theme picker (background + text colours, applied live)
-        tk.Label(top, text="Theme:", bg=C["panel"], fg=C["dim"],
-                 font=UI_FONT).pack(side="right", padx=(8, 2))
+        tl = tk.Label(top, text="Theme:", bg=C["panel"], fg=C["dim"],
+                      font=UI_FONT)
+        top.add(tl, padx=(10, 2), pady=6)
         self.theme_var = tk.StringVar(value=self.theme_name)
         self.theme_opt = tk.OptionMenu(top, self.theme_var, *THEME_NAMES,
                                        command=self._on_theme_pick)
@@ -3737,17 +4552,22 @@ class App(tk.Tk):
                                          activebackground=C["accent"],
                                          activeforeground=C["bg"], relief="flat",
                                          font=UI_FONT)
-        self.theme_opt.pack(side="right", padx=4, pady=6)
+        top.add(self.theme_opt, padx=3, pady=6)
         attach_hover(self.theme_opt, C["panel2"], C["fg"])
+        # colour editor: pick text/background (and every role) by hand
+        top.add(self._btn(top, "🎨 Colors…", self.open_color_editor, C["panel2"]),
+                padx=3, pady=6)
 
-        # body: sidebar + notebook
-        body = ttk.Frame(self)
+        # body: resizable sidebar (drag the divider) + notebook
+        body = ttk.PanedWindow(self, orient="horizontal")
         body.pack(fill="both", expand=True, padx=8, pady=4)
 
         side = tk.Frame(body, bg=C["panel"], width=250, highlightthickness=1,
                         highlightbackground=C["border"])
-        side.pack(side="left", fill="y", padx=(0, 8))
-        side.pack_propagate(False)
+        try:
+            body.add(side, weight=0, minsize=210)
+        except Exception:                     # older Tk: no pane minsize
+            body.add(side, weight=0)
 
         side_cv = tk.Canvas(side, bg=C["panel"], highlightthickness=0)
         side_sb = ttk.Scrollbar(side, orient="vertical", command=side_cv.yview)
@@ -3755,9 +4575,12 @@ class App(tk.Tk):
         side_sb.pack(side="right", fill="y")
         side_cv.pack(side="left", fill="both", expand=True)
         side_in = tk.Frame(side_cv, bg=C["panel"])
-        side_cv.create_window((0, 0), window=side_in, anchor="nw")
+        _side_win = side_cv.create_window((0, 0), window=side_in, anchor="nw")
         side_in.bind("<Configure>",
                      lambda e: side_cv.configure(scrollregion=side_cv.bbox("all")))
+        # content width follows the (resizable) sidebar so labels wrap, not clip
+        side_cv.bind("<Configure>", lambda e: side_cv.itemconfigure(
+            _side_win, width=max(160, e.width - 2)))
 
         def _mousewheel(ev):
             side_cv.yview_scroll(-1 * (ev.delta // 120 if ev.delta else 0), "units")
@@ -3771,6 +4594,7 @@ class App(tk.Tk):
             side_cv.unbind_all("<Button-5>")))
 
         self.actions = []
+        self._action_buttons = []
 
         def section(title):
             tk.Label(side_in, text=title, bg=C["panel"], fg=C["accent"],
@@ -3781,10 +4605,21 @@ class App(tk.Tk):
             b = tk.Button(side_in, text=label, command=fn, anchor="w", bg=C["panel2"],
                           fg=C["fg"], activebackground=C["accent"],
                           activeforeground=C["bg"], relief="flat", font=MONO,
-                          cursor="hand2", pady=4)
+                          cursor="hand2", pady=4, justify="left", wraplength=210)
             b.pack(fill="x", padx=8, pady=1)
             attach_hover(b, C["panel2"], C["fg"], lift=0.10)
             self.actions.append((label, fn))
+            self._action_buttons.append(b)
+
+        # long labels wrap onto a second line when the sidebar gets narrow
+        def _wrap_actions(evt):
+            wl = max(120, evt.width - 26)
+            for b in self._action_buttons:
+                try:
+                    b.configure(wraplength=wl)
+                except Exception:
+                    pass
+        side_in.bind("<Configure>", _wrap_actions, add="+")
 
         section("QUICK TESTS")
         action("Ping                Ctrl+1", lambda: self.run_cmd(cmd_ping(self.host(), self.count())))
@@ -3808,8 +4643,21 @@ class App(tk.Tk):
         action("Gateway Check       Ctrl+Y", self.run_gateway_check)
         action("Internet Check      Ctrl+X", self.run_internet_check)
         action("Flush DNS Cache     Ctrl+F", lambda: self.run_cmd(cmd_flush_dns()))
+        action("DNS Cache Info", lambda: self.run_cmd(cmd_dns_cache_info()))
         action("Full Diagnose       Ctrl+D", self.run_full_diagnose)
         action("SUPER Diagnose      Ctrl+0", self.run_super_diagnose)
+
+        section("TLS / SSL")
+        action("TLS Audit (all)      Ctrl+Shift+A", self.run_tls_audit)
+        action("TLS Versions", self.run_tls_versions)
+        action("Certificate Chain", self.run_tls_cert)
+
+        section("MORE NETWORK TESTS")
+        action("WHOIS Lookup         Ctrl+Shift+Y", self.run_whois)
+        action("NTP Time Check       Ctrl+Shift+M", self.run_ntp_check)
+        action("IPv6 Check           Ctrl+Shift+I", self.run_ipv6_check)
+        action("HTTP Headers", self.run_http_headers)
+        action("Service Ports", self.run_service_ports)
 
         section("TRAFFIC MONITORS")
         action("Ping Graph (compare)Ctrl+E", self.show_pinggraph)
@@ -3854,7 +4702,7 @@ class App(tk.Tk):
 
         # notebook
         self.nb = ttk.Notebook(body)
-        self.nb.pack(side="left", fill="both", expand=True)
+        body.add(self.nb, weight=1)
 
         self.terminals = TerminalsPanel(self.nb, self)
         self.nb.add(self.terminals, text="  Terminals  ")
@@ -3942,6 +4790,10 @@ class App(tk.Tk):
         b("<Control-N>", lambda e: self.cycle_theme())   # Ctrl+Shift+N: next theme
         b("<Control-L>", lambda e: self.show_protocol())  # Ctrl+Shift+L: protocol lab
         b("<Control-K>", lambda e: self.run_all_protocols())
+        b("<Control-A>", lambda e: self.run_tls_audit())   # Ctrl+Shift+A: TLS audit
+        b("<Control-Y>", lambda e: self.run_whois())       # Ctrl+Shift+Y: WHOIS
+        b("<Control-M>", lambda e: self.run_ntp_check())   # Ctrl+Shift+M: NTP
+        b("<Control-I>", lambda e: self.run_ipv6_check())  # Ctrl+Shift+I: IPv6
         b("<F5>", lambda e: self.run_selected())
 
     # -- helpers ------------------------------------------------------------
@@ -4101,8 +4953,11 @@ class App(tk.Tk):
                 ("  Shortcuts: Ctrl+1..9 tests · Ctrl+D full diagnose · Ctrl+M matrix · "
                  "Ctrl+T traffic · Ctrl+S save · F5 run", "info"),
                 ("  Protocol Lab: Ctrl+Shift+L opens it · Ctrl+Shift+K runs all "
-                 "17 protocol tests", "info"),
-                ("  Themes: pick one in the top bar, or Ctrl+Shift+N to cycle", "info"),
+                 f"{len(PROTOCOL_TESTS)} protocol tests", "info"),
+                ("  Themes: pick one in the top bar, or Ctrl+Shift+N to cycle · "
+                 "🎨 Colors… edits text/background colours", "info"),
+                ("  TLS/SSL: Ctrl+Shift+A audit · Ctrl+Shift+Y WHOIS · "
+                 "Ctrl+Shift+M NTP · Ctrl+Shift+I IPv6", "info"),
                 ("  Select a test on the left, or press a shortcut key.", "warn"),
                 ("─" * 78, "info"),
             ]
@@ -4491,6 +5346,82 @@ class App(tk.Tk):
             lambda pane, e: internet_check(e),
             "internet check finished")
 
+    # -- TLS / SSL + extra network tests -------------------------------------
+    def _host_port(self):
+        """(host, port) from the target field — supports 'host:port'."""
+        h = self.host().strip()
+        if h.count(":") == 1 and h.rsplit(":", 1)[1].isdigit():
+            host, port = h.rsplit(":", 1)
+            return host, int(port)
+        return h, 443
+
+    def run_tls_audit(self):
+        h, p = self._host_port()
+        self._monitor_thread(
+            [f"TLS/SSL audit — {h}:{p}  (versions + certificate chain)"],
+            lambda pane, e: tls_audit(h, p, e, self.stop_flag),
+            "TLS audit finished")
+
+    def run_tls_versions(self):
+        h, p = self._host_port()
+        self._monitor_thread(
+            [f"TLS/SSL version matrix — {h}:{p}"],
+            lambda pane, e: tls_versions_report(h, p, e, self.stop_flag),
+            "TLS version check finished")
+
+    def run_tls_cert(self):
+        h, p = self._host_port()
+        self._monitor_thread(
+            [f"TLS certificate chain — {h}:{p}"],
+            lambda pane, e: tls_certificate_report(h, p, e, self.stop_flag),
+            "certificate report finished")
+
+    def run_whois(self):
+        h = self.host()
+        self._monitor_thread(
+            [f"WHOIS lookup — {h}"],
+            lambda pane, e: whois_lookup(h, e),
+            "WHOIS lookup finished")
+
+    def run_ntp_check(self):
+        self._monitor_thread(
+            ["NTP time check — pool.ntp.org:123"],
+            lambda pane, e: ntp_check(e),
+            "NTP check finished")
+
+    def run_ipv6_check(self):
+        h = _short_host(self.host())
+        self._monitor_thread(
+            [f"IPv6 connectivity check — {h}"],
+            lambda pane, e: ipv6_check(h, e),
+            "IPv6 check finished")
+
+    def run_http_headers(self):
+        h = self.host()
+        self._monitor_thread(
+            [f"HTTP headers — {h}"],
+            lambda pane, e: http_headers_report(h, e),
+            "HTTP header check finished")
+
+    def run_service_ports(self):
+        h = _short_host(self.host())
+        self._monitor_thread(
+            [f"well-known service ports — {h}"],
+            lambda pane, e: common_ports_check(h, e, stop=self.stop_flag),
+            "service port check finished")
+
+    def open_color_editor(self):
+        win = getattr(self, "_color_win", None)
+        if win is not None:
+            try:
+                if win.winfo_exists():
+                    win.lift()
+                    win.focus_force()
+                    return
+            except Exception:
+                pass
+        self._color_win = ColorEditor(self, self)
+
     def run_netstat_stats(self):
         self.run_cmd(["netstat", "-s"])
 
@@ -4704,8 +5635,11 @@ class App(tk.Tk):
 
 
 def cli_mode(argv):
-    """Text-only mode for SSH / headless use:  python netprobe.py --cli [host]"""
-    flags = {"--speed", "--matrix"}
+    """Text-only mode for SSH / headless use:  python netprobe.py --cli [host]
+
+    Flags: --speed  --matrix  --tls  --whois  --ntp  --ports
+    """
+    flags = {"--speed", "--matrix", "--tls", "--whois", "--ntp", "--ports"}
     args = [a for a in argv if a not in flags]
     host = args[0] if args else "8.8.8.8"
     print(f"{APP_NAME} v{VERSION} CLI — {platform.system()} {platform.release()} "
@@ -4752,6 +5686,27 @@ def cli_mode(argv):
         res = speed_test(emit=lambda t: print(t))
         print(f"  latency {res.get('latency_ms', 0):.1f} ms | "
               f"down {res.get('down_mbps', 0):.2f} Mbps | up {res.get('up_mbps', 0):.2f} Mbps")
+
+    if "--tls" in argv:
+        print("[TLS/SSL audit]")
+        h, p = host, 443
+        if h.count(":") == 1 and h.rsplit(":", 1)[1].isdigit():
+            h, p = h.rsplit(":", 1)
+            p = int(p)
+        st, summary = tls_audit(h, p, lambda t, tag="head": print(t))
+        print(f"  => {st}: {summary}")
+
+    if "--whois" in argv:
+        print("[WHOIS]")
+        whois_lookup(host, lambda t, tag="head": print(t))
+
+    if "--ntp" in argv:
+        print("[NTP]")
+        ntp_check(lambda t, tag="head": print(t))
+
+    if "--ports" in argv:
+        print("[Well-known service ports]")
+        common_ports_check(_short_host(host), lambda t, tag="head": print(t))
 
     if "--matrix" in argv:
         print("[Host matrix]")
